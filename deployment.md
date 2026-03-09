@@ -45,9 +45,12 @@ pip install streamlit python-pptx openai tiktoken pandas
 ## 5. Configure the API key
 
 ```bash
-echo 'OPENAI_API_KEY="sk-..."' > ~/.env_evaluator
+printf 'OPENAI_API_KEY=sk-...\n' > ~/.env_evaluator
 chmod 600 ~/.env_evaluator
 ```
+
+If you are deploying as `root`, this creates `/root/.env_evaluator`.
+If you are deploying as `evaluator`, this creates `/home/evaluator/.env_evaluator`.
 
 ## 6. Firewall
 
@@ -67,6 +70,13 @@ sudo ufw enable
 
 Create a service file so the app starts on boot and restarts on failure:
 
+Before creating the service, make sure the service user and paths match your actual install.
+
+- If you created the `evaluator` user and cloned the repo in `/home/evaluator/indiainnovates-automation`, use `User=evaluator` and `/home/evaluator/...` paths.
+- If you are running everything as `root` from `/root/indiainnovates-automation`, use `User=root` and `/root/...` paths.
+
+Example for a `root` deployment:
+
 ```bash
 sudo tee /etc/systemd/system/evaluator.service > /dev/null <<'EOF'
 [Unit]
@@ -74,10 +84,10 @@ Description=India Innovates 2026 Evaluator
 After=network.target
 
 [Service]
-User=evaluator
-WorkingDirectory=/home/evaluator/indiainnovates-automation
-EnvironmentFile=/home/evaluator/.env_evaluator
-ExecStart=/home/evaluator/indiainnovates-automation/venv/bin/streamlit run ii2026_evaluator.py --server.port 8501 --server.address 0.0.0.0
+User=root
+WorkingDirectory=/root/indiainnovates-automation
+EnvironmentFile=/root/.env_evaluator
+ExecStart=/root/indiainnovates-automation/venv/bin/streamlit run ii2026_evaluator.py --server.port 8501 --server.address 0.0.0.0
 Restart=on-failure
 RestartSec=5
 
@@ -85,6 +95,8 @@ RestartSec=5
 WantedBy=multi-user.target
 EOF
 ```
+
+If you are using the `evaluator` user instead, replace `root` with `evaluator` and replace `/root/` with `/home/evaluator/` in all three lines above.
 
 ```bash
 sudo systemctl daemon-reload
