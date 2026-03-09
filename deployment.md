@@ -77,7 +77,7 @@ After=network.target
 User=evaluator
 WorkingDirectory=/home/evaluator/indiainnovates-automation
 EnvironmentFile=/home/evaluator/.env_evaluator
-ExecStart=/home/evaluator/indiainnovates-automation/venv/bin/streamlit run ii2026_evaluator.py --server.port 8501 --server.address 127.0.0.1
+ExecStart=/home/evaluator/indiainnovates-automation/venv/bin/streamlit run ii2026_evaluator.py --server.port 8501 --server.address 0.0.0.0
 Restart=on-failure
 RestartSec=5
 
@@ -99,9 +99,24 @@ sudo systemctl status evaluator
 sudo journalctl -u evaluator -f
 ```
 
-## 8. Reverse proxy with Nginx (recommended)
+At this point the app is live at `http://<vps-ip>:8501` — no reverse proxy needed.
+
+If you want HTTPS or to hide Streamlit behind a proper web server, continue with sections 8 and 9 below. Otherwise skip to **section 10**.
+
+---
+
+## 8. (Optional) Reverse proxy with Nginx
 
 Serving through Nginx lets you add HTTPS and avoid exposing Streamlit directly.
+
+If you use Nginx, first change the systemd bind address to localhost so Streamlit is not directly reachable:
+
+```bash
+# Edit the service file
+sudo sed -i 's/--server.address 0.0.0.0/--server.address 127.0.0.1/' /etc/systemd/system/evaluator.service
+sudo systemctl daemon-reload
+sudo systemctl restart evaluator
+```
 
 ```bash
 sudo apt install -y nginx
