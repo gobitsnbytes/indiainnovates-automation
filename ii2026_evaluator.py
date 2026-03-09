@@ -13,6 +13,7 @@ Otherwise, total is capped at 1.00. IN threshold is 0.60.
 
 from __future__ import annotations
 
+import csv
 import json
 import sqlite3
 import time
@@ -31,6 +32,7 @@ MAX_FILES_BATCH = 10
 MAX_PPT_TOKENS = 3000
 LLM_CONTEXT_SOFT_LIMIT = 7000
 DB_PATH = Path("selected.db")
+AUDIT_LOG_PATH = Path("audit_log.csv")
 
 MEDIA_SCORE_MAP = {0: 0.00, 1: 0.10, 5: 0.25}
 PROTO_SCORE_MAP = {0: 0.00, 1: 0.10, 5: 0.35}
@@ -266,6 +268,31 @@ def insert_selected(row: dict[str, Any]) -> None:
         connection.commit()
     finally:
         connection.close()
+
+
+def append_audit_log(row: dict[str, Any]) -> None:
+    fieldnames = [
+        "batch_ts",
+        "team_name",
+        "file_name",
+        "domain",
+        "problem_stmt",
+        "media_score",
+        "proto_score",
+        "ppt_score",
+        "align_score",
+        "total_score",
+        "verdict",
+        "ppt_verdict",
+        "align_verdict",
+        "red_flags",
+    ]
+    file_exists = AUDIT_LOG_PATH.exists()
+    with AUDIT_LOG_PATH.open("a", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({field: row.get(field, "") for field in fieldnames})
 
 
 def normalize_whitespace(text: str) -> str:
@@ -851,6 +878,11 @@ else:
             if not submission.get("ppt_payload"):
                 refresh_extraction(submission)
 
+            domain = submission["domain"]
+            ps_key = submission["ps_key"]
+            sub = submission
+            fname = file_name
+
             if submission.get("proto_rating", 0) == 0:
                 submission["llm_result"] = {
                     "ppt_score_raw": "SKIPPED",
@@ -859,13 +891,39 @@ else:
                     "alignment_verdict": "Skipped because Prototype + GitHub rating is 0.",
                     "red_flags": ["PROTO_GH_HARD_GATE_FAILED"],
                 }
-                st.session_state.results.append(make_auto_out_result_row(file_name, submission))
+                llm_result = submission["llm_result"]
+                result_row = make_auto_out_result_row(file_name, submission)
+                st.session_state.results.append(result_row)
+
+                m_q = result_row["Media Score"]
+                p_q = result_row["Prototype Score"]
+                ppt_q = result_row["PPT Score"]
+                al_q = result_row["Alignment Score"]
+                total_score = result_row["TOTAL"]
+                verdict = result_row["VERDICT"]
+
+                append_audit_log(
+                    {
+                        "batch_ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "team_name": sub.get("team_name", ""),
+                        "file_name": fname,
+                        "domain": domain,
+                        "problem_stmt": ps_key,
+                        "media_score": m_q,
+                        "proto_score": p_q,
+                        "ppt_score": ppt_q,
+                        "align_score": al_q,
+                        "total_score": total_score,
+                        "verdict": verdict,
+                        "ppt_verdict": llm_result.get("ppt_verdict", ""),
+                        "align_verdict": llm_result.get("alignment_verdict", ""),
+                        "red_flags": " · ".join(llm_result.get("red_flags", [])),
+                    }
+                )
                 progress.progress(index / len(items), text=f"Completed {index}/{len(items)}")
                 time.sleep(0.1)
                 continue
 
-            domain = submission["domain"]
-            ps_key = submission["ps_key"]
             ps_text = PROBLEM_STATEMENTS[domain][ps_key]
 
             truncated_payload = truncate_to_tokens(submission["ppt_payload"], MAX_PPT_TOKENS, model_choice)
@@ -884,15 +942,14 @@ else:
             result_row = make_result_row(file_name, submission, llm_result)
             st.session_state.results.append(result_row)
 
+            m_q = result_row["Media Score"]
+            p_q = result_row["Prototype Score"]
+            ppt_q = result_row["PPT Score"]
+            al_q = result_row["Alignment Score"]
+            total_score = result_row["TOTAL"]
+
             verdict = result_row["VERDICT"]
             if verdict == "IN":
-                m_q = result_row["Media Score"]
-                p_q = result_row["Prototype Score"]
-                ppt_q = result_row["PPT Score"]
-                al_q = result_row["Alignment Score"]
-                total_score = result_row["TOTAL"]
-                sub = submission
-                fname = file_name
                 insert_selected(
                     {
                         "team_name": sub.get("team_name", ""),
@@ -909,6 +966,25 @@ else:
                         "red_flags": " · ".join(llm_result.get("red_flags", [])),
                     }
                 )
+
+            append_audit_log(
+                {
+                    "batch_ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "team_name": sub.get("team_name", ""),
+                    "file_name": fname,
+                    "domain": domain,
+                    "problem_stmt": ps_key,
+                    "media_score": m_q,
+                    "proto_score": p_q,
+                    "ppt_score": ppt_q,
+                    "align_score": al_q,
+                    "total_score": total_score,
+                    "verdict": verdict,
+                    "ppt_verdict": llm_result.get("ppt_verdict", ""),
+                    "align_verdict": llm_result.get("alignment_verdict", ""),
+                    "red_flags": " · ".join(llm_result.get("red_flags", [])),
+                }
+            )
 
             progress.progress(index / len(items), text=f"Completed {index}/{len(items)}")
             time.sleep(0.2)
