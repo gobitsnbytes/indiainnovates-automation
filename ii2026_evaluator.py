@@ -14,8 +14,10 @@ Otherwise, total is capped at 1.00. IN threshold is 0.60.
 from __future__ import annotations
 
 import json
+import sqlite3
 import time
 from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -28,6 +30,7 @@ IN_THRESHOLD = 0.60
 MAX_FILES_BATCH = 10
 MAX_PPT_TOKENS = 3000
 LLM_CONTEXT_SOFT_LIMIT = 7000
+DB_PATH = Path("selected.db")
 
 MEDIA_SCORE_MAP = {0: 0.00, 1: 0.10, 5: 0.25}
 PROTO_SCORE_MAP = {0: 0.00, 1: 0.10, 5: 0.35}
@@ -195,6 +198,74 @@ Follow these rules:
 5. Domain mentions without technical compliance deserve 0 or 2 raw, which both map to zero final alignment score.
 6. Return valid JSON only.
 """.strip()
+
+
+def init_db() -> None:
+    connection = sqlite3.connect(DB_PATH)
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS selected (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                inserted_at   TEXT    DEFAULT (datetime('now','localtime')),
+                team_name     TEXT,
+                file_name     TEXT    UNIQUE,
+                domain        TEXT,
+                problem_stmt  TEXT,
+                media_score   REAL,
+                proto_score   REAL,
+                ppt_score     REAL,
+                align_score   REAL,
+                total_score   REAL,
+                ppt_verdict   TEXT,
+                align_verdict TEXT,
+                red_flags     TEXT
+            )
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def insert_selected(row: dict[str, Any]) -> None:
+    connection = sqlite3.connect(DB_PATH)
+    try:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO selected (
+                team_name,
+                file_name,
+                domain,
+                problem_stmt,
+                media_score,
+                proto_score,
+                ppt_score,
+                align_score,
+                total_score,
+                ppt_verdict,
+                align_verdict,
+                red_flags
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row.get("team_name", ""),
+                row.get("file_name", ""),
+                row.get("domain", ""),
+                row.get("problem_stmt", ""),
+                row.get("media_score", 0.0),
+                row.get("proto_score", 0.0),
+                row.get("ppt_score", 0.0),
+                row.get("align_score", 0.0),
+                row.get("total_score", 0.0),
+                row.get("ppt_verdict", ""),
+                row.get("align_verdict", ""),
+                row.get("red_flags", ""),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
 
 
 def normalize_whitespace(text: str) -> str:
@@ -568,6 +639,7 @@ def make_auto_out_result_row(file_name: str, submission: dict[str, Any]) -> dict
     }
 
 
+init_db()
 st.set_page_config(page_title="India Innovates 2026 Evaluator", page_icon="🇮🇳", layout="wide")
 
 for key, default in (("submissions", {}), ("results", [])):
@@ -809,7 +881,34 @@ else:
 
             llm_result = safe_call_openai(prompt, api_key, model_choice)
             submission["llm_result"] = llm_result
-            st.session_state.results.append(make_result_row(file_name, submission, llm_result))
+            result_row = make_result_row(file_name, submission, llm_result)
+            st.session_state.results.append(result_row)
+
+            verdict = result_row["VERDICT"]
+            if verdict == "IN":
+                m_q = result_row["Media Score"]
+                p_q = result_row["Prototype Score"]
+                ppt_q = result_row["PPT Score"]
+                al_q = result_row["Alignment Score"]
+                total_score = result_row["TOTAL"]
+                sub = submission
+                fname = file_name
+                insert_selected(
+                    {
+                        "team_name": sub.get("team_name", ""),
+                        "file_name": fname,
+                        "domain": domain,
+                        "problem_stmt": ps_key,
+                        "media_score": m_q,
+                        "proto_score": p_q,
+                        "ppt_score": ppt_q,
+                        "align_score": al_q,
+                        "total_score": total_score,
+                        "ppt_verdict": llm_result.get("ppt_verdict", ""),
+                        "align_verdict": llm_result.get("alignment_verdict", ""),
+                        "red_flags": " · ".join(llm_result.get("red_flags", [])),
+                    }
+                )
 
             progress.progress(index / len(items), text=f"Completed {index}/{len(items)}")
             time.sleep(0.2)
@@ -862,3 +961,26 @@ if st.session_state.results:
         st.session_state.submissions = {}
         st.session_state.results = []
         st.rerun()
+
+with st.expander("📋 All Selected Participants (this event)"):
+    connection = sqlite3.connect(DB_PATH)
+    try:
+        selected_df = pd.read_sql_query("SELECT * FROM selected ORDER BY total_score DESC", connection)
+    finally:
+        connection.close()
+
+    if selected_df.empty:
+        st.caption("No selected participants stored yet.")
+    else:
+        st.dataframe(
+            selected_df[["inserted_at", "team_name", "domain", "problem_stmt", "total_score"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.download_button(
+            "Download selected participants CSV",
+            data=selected_df.to_csv(index=False).encode("utf-8"),
+            file_name="selected_participants.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
