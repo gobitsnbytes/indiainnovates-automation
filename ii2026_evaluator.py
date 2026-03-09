@@ -43,7 +43,11 @@ INJECTION_PATTERNS = ["ignore", "disregard", "system:", "assistant:", "[inst]", 
 MODEL_CONTEXT_WINDOWS = {
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
+    "gpt-5-mini": 350_000,
+    "gpt-4.1-mini": 1_000_000,
+    "gpt-4.1": 1_000_000,
 }
+MODEL_OPTIONS = list(MODEL_CONTEXT_WINDOWS.keys())
 
 MEDIA_SCORE_MAP = {0: 0.00, 1: 0.10, 5: 0.25}
 PROTO_SCORE_MAP = {0: 0.00, 1: 0.10, 5: 0.35}
@@ -955,7 +959,7 @@ with st.sidebar:
     st.divider()
 
     api_key = st.text_input("OpenAI API key", type="password", placeholder="sk-...")
-    model_choice = st.selectbox("Model", options=["gpt-4o", "gpt-4o-mini"], index=0)
+    model_choice = st.selectbox("Model", options=MODEL_OPTIONS, index=0)
 
     st.divider()
     st.markdown("### Marking scheme in use")
