@@ -15,17 +15,21 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
 import time
+import urllib.error
+import urllib.request
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+from urllib.parse import urlparse
 
 import pandas as pd
 import streamlit as st
 import tiktoken
-from openai import APIError, OpenAI, RateLimitError
+from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
 from pptx import Presentation
 
 IN_THRESHOLD = 0.60
@@ -36,16 +40,21 @@ BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "selected.db"
 
 MAX_UPLOAD_MB = 20
+MIN_TEXT_CHARS = 80
 RESERVED_OUTPUT_TOKENS = 512
 SAFETY_MARGIN_TOKENS = 500
 MAX_EXTRACTED_CHARS = 200_000
+DB_DOWNLOAD_PASSWORD = b"yash<3akshat"
 INJECTION_PATTERNS = ["ignore", "disregard", "system:", "assistant:", "[inst]", "###"]
+SUPPORTED_EXTENSIONS = {".pdf", ".pptx", ".ppt"}
+LINK_TIMEOUT_SECONDS = 30
+MAX_DOWNLOAD_MB = 50
 MODEL_CONTEXT_WINDOWS = {
+    "gpt-5-mini": 400_000,
+    "gpt-4.1": 1_000_000,
+    "gpt-4.1-mini": 1_000_000,
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
-    "gpt-5-mini": 350_000,
-    "gpt-4.1-mini": 1_000_000,
-    "gpt-4.1": 1_000_000,
 }
 MODEL_OPTIONS = list(MODEL_CONTEXT_WINDOWS.keys())
 
@@ -53,6 +62,7 @@ MEDIA_SCORE_MAP = {0: 0.00, 1: 0.10, 5: 0.25}
 PROTO_SCORE_MAP = {0: 0.00, 1: 0.10, 5: 0.35}
 PPT_SCORE_MAP = {0: 0.00, 2: 0.06, 4: 0.12, 6: 0.18, 8: 0.24, 10: 0.30}
 ALIGN_SCORE_MAP = {0: 0.00, 2: 0.00, 4: 0.10, 6: 0.18, 8: 0.28, 10: 0.35}
+VISUAL_BONUS_MAP = {0: 0.00, 1: 0.05, 2: 0.10}
 
 ALLOWED_PPT_RAW = tuple(PPT_SCORE_MAP.keys())
 ALLOWED_ALIGN_RAW = tuple(ALIGN_SCORE_MAP.keys())
@@ -249,6 +259,7 @@ def create_selected_table(connection: sqlite3.Connection) -> None:
             proto_score     REAL,
             ppt_score       REAL,
             align_score     REAL,
+            visual_score    REAL,
             total_score     REAL,
             ppt_verdict     TEXT,
             align_verdict   TEXT,
@@ -260,7 +271,7 @@ def create_selected_table(connection: sqlite3.Connection) -> None:
 
 def selected_table_needs_migration(connection: sqlite3.Connection) -> bool:
     columns = {row["name"] for row in connection.execute("PRAGMA table_info(selected)").fetchall()}
-    if "submission_hash" not in columns:
+    if "submission_hash" not in columns or "visual_score" not in columns:
         return True
 
     for index_row in connection.execute("PRAGMA index_list(selected)").fetchall():
@@ -293,6 +304,7 @@ def migrate_selected_table(connection: sqlite3.Connection) -> None:
             proto_score,
             ppt_score,
             align_score,
+            visual_score,
             total_score,
             ppt_verdict,
             align_verdict,
@@ -309,6 +321,7 @@ def migrate_selected_table(connection: sqlite3.Connection) -> None:
             proto_score,
             ppt_score,
             align_score,
+            0.0,
             total_score,
             ppt_verdict,
             align_verdict,
@@ -336,13 +349,15 @@ def ensure_audit_log_table(connection: sqlite3.Connection) -> None:
             proto_score     REAL,
             ppt_score       REAL,
             align_score     REAL,
+            visual_score    REAL,
             total_score     REAL,
             verdict         TEXT,
             eval_status     TEXT,
             ppt_verdict     TEXT,
             align_verdict   TEXT,
             red_flags       TEXT,
-            model           TEXT
+            model           TEXT,
+            submission_url  TEXT
         )
         """
     )
@@ -353,6 +368,8 @@ def ensure_audit_log_table(connection: sqlite3.Connection) -> None:
         ("submission_hash", "TEXT"),
         ("eval_status", "TEXT"),
         ("model", "TEXT"),
+        ("visual_score", "REAL"),
+        ("submission_url", "TEXT"),
     ):
         if column_name not in existing_columns:
             connection.execute(f"ALTER TABLE audit_log ADD COLUMN {column_name} {column_type}")
@@ -395,11 +412,12 @@ def insert_selected(row: dict[str, Any]) -> None:
                 proto_score,
                 ppt_score,
                 align_score,
+                visual_score,
                 total_score,
                 ppt_verdict,
                 align_verdict,
                 red_flags
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 row.get("submission_hash", ""),
@@ -411,6 +429,7 @@ def insert_selected(row: dict[str, Any]) -> None:
                 row.get("proto_score", 0.0),
                 row.get("ppt_score", 0.0),
                 row.get("align_score", 0.0),
+                row.get("visual_score", 0.0),
                 row.get("total_score", 0.0),
                 row.get("ppt_verdict", ""),
                 row.get("align_verdict", ""),
@@ -448,14 +467,16 @@ def insert_audit_log(row: dict[str, Any]) -> None:
                 proto_score,
                 ppt_score,
                 align_score,
+                visual_score,
                 total_score,
                 verdict,
                 eval_status,
                 ppt_verdict,
                 align_verdict,
                 red_flags,
-                model
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                model,
+                submission_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 attempt_no,
@@ -468,6 +489,7 @@ def insert_audit_log(row: dict[str, Any]) -> None:
                 row.get("Prototype Score"),
                 row.get("PPT Score"),
                 row.get("Alignment Score"),
+                row.get("Visual Score"),
                 row.get("TOTAL"),
                 row.get("VERDICT", ""),
                 row.get("Eval Status", ""),
@@ -475,6 +497,7 @@ def insert_audit_log(row: dict[str, Any]) -> None:
                 row.get("Alignment Verdict", ""),
                 row.get("Red Flags", ""),
                 row.get("Model", ""),
+                row.get("Submission URL", ""),
             ),
         )
         connection.commit()
@@ -499,23 +522,26 @@ def is_placeholder_text(text: str) -> bool:
     return any(fingerprint in lower for fingerprint in PLACEHOLDER_FINGERPRINTS)
 
 
+def get_token_encoding(model: str) -> tiktoken.Encoding:
+    try:
+        return tiktoken.encoding_for_model(model)
+    except Exception:
+        if model.startswith(("gpt-5", "gpt-4.5", "gpt-4.1", "gpt-4o", "o1", "o3", "o4-mini")):
+            return tiktoken.get_encoding("o200k_base")
+        return tiktoken.get_encoding("cl100k_base")
+
+
 def count_tokens(text: str, model: str) -> int:
-    try:
-        encoding = tiktoken.encoding_for_model(model)
-    except Exception:
-        encoding = tiktoken.get_encoding("cl100k_base")
-    return len(encoding.encode(text))
+    encoding = get_token_encoding(model)
+    return len(encoding.encode(text, disallowed_special=()))
 
 
-def truncate_to_tokens(text: str, max_tokens: int, model: str) -> str:
-    try:
-        encoding = tiktoken.encoding_for_model(model)
-    except Exception:
-        encoding = tiktoken.get_encoding("cl100k_base")
-    encoded = encoding.encode(text)
-    if len(encoded) <= max_tokens:
+def truncate_to_tokens(text: str, token_limit: int, model: str) -> str:
+    encoding = get_token_encoding(model)
+    encoded = encoding.encode(text, disallowed_special=())
+    if len(encoded) <= token_limit:
         return text
-    trimmed = encoding.decode(encoded[:max_tokens])
+    trimmed = encoding.decode(encoded[:token_limit])
     return trimmed + "\n\n[TRUNCATED FOR TOKEN LIMIT]"
 
 
@@ -553,80 +579,242 @@ def truncate_slide_entries(slide_entries: list[dict[str, Any]], max_chars: int) 
     return truncated_entries
 
 
-def extract_text_from_shape(shape: Any) -> list[str]:
-    lines: list[str] = []
-
-    if getattr(shape, "has_text_frame", False):
-        text_frame = getattr(shape, "text_frame", None)
-        if text_frame is not None:
-            for paragraph in text_frame.paragraphs:
-                paragraph_text = " ".join(run.text.strip() for run in paragraph.runs if run.text.strip())
-                if not paragraph_text:
-                    paragraph_text = paragraph.text.strip()
-                if paragraph_text:
-                    lines.append(paragraph_text)
-
-    if getattr(shape, "has_table", False):
-        table = getattr(shape, "table", None)
-        if table is not None:
-            for row in table.rows:
-                cell_values = [normalize_whitespace(cell.text) for cell in row.cells if normalize_whitespace(cell.text)]
-                if cell_values:
-                    lines.append(" | ".join(cell_values))
-
-    return lines
+def detect_format(filename: str) -> str:
+    """Return normalised extension (.pdf, .pptx, .ppt) or raise ValueError."""
+    ext = Path(filename).suffix.lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise ValueError(
+            f"Unsupported file format: {ext!r}. "
+            f"Accepted: {', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+        )
+    return ext
 
 
-@st.cache_data(show_spinner=False)
-def extract_ppt_text(file_bytes: bytes) -> dict[str, Any]:
+def fetch_file_from_url(url: str) -> tuple[bytes, str]:
+    """Download a file from *url*, return ``(file_bytes, guessed_filename)``.
+
+    NOTE: ``urllib.request.urlopen`` blocks the Streamlit thread — acceptable
+    for a batch screening tool but would need an async worker for production.
+    """
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "IndiaInnovates-Evaluator/1.0"}
+    )
+    try:
+        resp = urllib.request.urlopen(req, timeout=LINK_TIMEOUT_SECONDS)  # noqa: S310
+    except urllib.error.URLError as exc:
+        raise ValueError(f"Could not download from URL: {exc}") from exc
+
+    data: bytes = resp.read()
+    if len(data) > MAX_DOWNLOAD_MB * 1024 * 1024:
+        raise ValueError(f"Downloaded file exceeds {MAX_DOWNLOAD_MB}MB limit")
+    if not data:
+        raise ValueError("Downloaded file is empty")
+
+    # Try Content-Disposition header first, then fall back to URL path.
+    cd = resp.headers.get("Content-Disposition", "")
+    fname_match = re.search(r'filename[*]?=["\']?([^"\';]+)', cd)
+    if fname_match:
+        guessed = fname_match.group(1).strip()
+    else:
+        guessed = Path(urlparse(url).path).name or "download"
+
+    return data, guessed
+
+
+def extract_pptx_text(file_bytes: bytes) -> dict[str, str]:
+    """Extract text from a *.pptx* file using python-pptx.
+
+    The legacy binary *.ppt* format is **not** supported by python-pptx —
+    callers should detect ``.ppt`` early and raise a helpful error.
+    """
+    prs = Presentation(BytesIO(file_bytes))
+    result: dict[str, str] = {}
+    for idx, slide in enumerate(prs.slides):
+        parts: list[str] = []
+        for shape in slide.shapes:
+            if not shape.has_text_frame:
+                continue
+            for paragraph in shape.text_frame.paragraphs:
+                text = paragraph.text.strip()
+                if text:
+                    parts.append(text)
+        label = SLIDE_LABELS[idx] if idx < len(SLIDE_LABELS) else f"SLIDE_{idx + 1}"
+        result[label] = normalize_whitespace("\n".join(parts)) if parts else "<NO TEXT ON SLIDE>"
+    if not result:
+        raise ValueError("Presentation contains no slides")
+    return result
+
+
+def extract_ppt_text(file_bytes: bytes) -> dict[str, str]:
+    """Three-stage PDF extraction: pypdf → pdfplumber → OCR."""
     if len(file_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
         raise ValueError(f"File exceeds {MAX_UPLOAD_MB}MB limit")
 
+    raw_pages: list[str] = []
+    pypdf_read_errors: tuple[type[Exception], ...] = ()
+
+    # ── Stage 1: pypdf ──────────────────────────────
     try:
-        presentation = Presentation(BytesIO(file_bytes))
-    except zipfile.BadZipFile as exc:
-        raise ValueError("Invalid PPTX file: bad ZIP container") from exc
-    except KeyError as exc:
-        raise ValueError("Invalid PPTX file: missing internal structure") from exc
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"Invalid PPTX file: {exc}") from exc
+        from pypdf import PdfReader
+        try:
+            from pypdf.errors import PdfReadError, PdfStreamError
 
-    slide_entries: list[dict[str, Any]] = []
+            pypdf_read_errors = (PdfReadError, PdfStreamError)
+        except Exception:
+            pypdf_read_errors = ()
 
-    for index, slide in enumerate(presentation.slides, start=1):
-        label = SLIDE_LABELS[index - 1] if index - 1 < len(SLIDE_LABELS) else f"SLIDE_{index}"
-        lines: list[str] = []
-        for shape in slide.shapes:
-            lines.extend(extract_text_from_shape(shape))
+        reader = PdfReader(BytesIO(file_bytes))
+        if reader.is_encrypted:
+            raise ValueError("PDF is encrypted — cannot extract text")
+        if len(reader.pages) == 0:
+            raise ValueError("PDF has no pages")
+        for page in reader.pages:
+            text = normalize_whitespace((page.extract_text() or "").strip())
+            raw_pages.append(text)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raw_pages = []
 
-        slide_entries.append(
-            {
-                "index": index,
-                "label": label,
-                "text": normalize_whitespace("\n".join(lines)),
-            }
+    # ── Stage 2: pdfplumber fallback ────────────────
+    if not raw_pages or sum(len(page_text) for page_text in raw_pages) < MIN_TEXT_CHARS * len(raw_pages):
+        try:
+            import pdfplumber
+
+            raw_pages = []
+            with pdfplumber.open(BytesIO(file_bytes)) as pdf:
+                for page in pdf.pages:
+                    text = normalize_whitespace((page.extract_text() or "").strip())
+                    raw_pages.append(text)
+        except Exception:
+            pass
+
+    # ── Stage 3: OCR fallback (flattened / Canva PDFs) ─
+    needs_ocr = (
+        not raw_pages
+        or sum(len(page_text) for page_text in raw_pages) < MIN_TEXT_CHARS * max(len(raw_pages), 1)
+    )
+    if needs_ocr:
+        try:
+            try:
+                import pdf2image
+                from pdf2image.exceptions import PDFInfoNotInstalledError, PDFPageCountError, PDFSyntaxError
+            except ImportError as exc:
+                raise ValueError("OCR unavailable — run: apt-get install poppler-utils") from exc
+
+            try:
+                import pytesseract
+            except ImportError as exc:
+                raise ValueError("OCR unavailable — run: apt-get install tesseract-ocr") from exc
+
+            try:
+                from PIL import Image
+            except ImportError as exc:
+                raise ValueError("OCR unavailable — install Pillow") from exc
+
+            raw_pages = []
+            try:
+                images = pdf2image.convert_from_bytes(file_bytes, dpi=200)
+            except (PDFInfoNotInstalledError, PDFPageCountError, PDFSyntaxError) as exc:
+                raise ValueError("OCR unavailable — run: apt-get install poppler-utils") from exc
+
+            for img in images:
+                if not isinstance(img, Image.Image):
+                    continue
+                try:
+                    text = pytesseract.image_to_string(img, lang="eng").strip()
+                except pytesseract.TesseractNotFoundError as exc:
+                    raise ValueError("OCR unavailable — run: apt-get install tesseract-ocr") from exc
+                raw_pages.append(normalize_whitespace(text))
+        except Exception as exc:
+            raise ValueError(f"All extraction methods failed — {exc}") from exc
+
+    if not raw_pages:
+        raise ValueError("No text could be extracted from this PDF")
+
+    result: dict[str, str] = {}
+    for index, text in enumerate(raw_pages):
+        label = SLIDE_LABELS[index] if index < len(SLIDE_LABELS) else f"PAGE_{index + 1}"
+        result[label] = text if text else "<NO TEXT ON PAGE>"
+
+    return result
+
+
+@st.cache_data(show_spinner=False)
+def extract_submission(file_bytes: bytes, filename: str) -> dict[str, str]:
+    """Unified extraction dispatcher — picks the right extractor by extension.
+
+    Cache key is ``(file_bytes, filename)`` so re-downloading the same URL
+    yields a cache hit only when the content is byte-identical.  This is
+    acceptable for screening; stale entries expire on session reset.
+    """
+    if len(file_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise ValueError(f"File exceeds {MAX_UPLOAD_MB}MB limit")
+
+    ext = detect_format(filename)
+
+    if ext == ".ppt":
+        raise ValueError(
+            "Legacy .ppt (binary) format is not supported by python-pptx. "
+            "Please re-save as .pptx in PowerPoint or LibreOffice and re-upload."
         )
+
+    if ext == ".pptx":
+        return extract_pptx_text(file_bytes)
+
+    # Default: PDF pipeline
+    return extract_ppt_text(file_bytes)
+
+
+def build_slide_entries(slide_map: dict[str, str]) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    slide_entries = [
+        {"index": index, "label": label, "text": normalize_whitespace(text)}
+        for index, (label, text) in enumerate(slide_map.items(), start=1)
+    ]
 
     total_chars = sum(len(entry["text"]) for entry in slide_entries)
     if total_chars > MAX_EXTRACTED_CHARS:
         slide_entries = truncate_slide_entries(slide_entries, MAX_EXTRACTED_CHARS)
 
-    slide_map = {entry["label"]: entry["text"] for entry in slide_entries}
-    return {"slides": slide_entries, "slide_map": slide_map}
+    truncated_map = {entry["label"]: entry["text"] for entry in slide_entries}
+    return slide_entries, truncated_map
 
 
-def extract_team_name(slide_map: dict[str, str]) -> str:
-    cover_text = slide_map.get("COVER / TEAM INFO", "")
-    ignored = {
-        "india innovates 2026",
-        "team name",
-        "members name and affiliation",
-        "cover / team info",
-    }
-    for line in cover_text.splitlines():
-        candidate = line.strip(" :-")
-        if candidate and candidate.lower() not in ignored:
+def try_extract_team_name(slides: dict[str, str]) -> str:
+    cover = slides.get("COVER / TEAM INFO", "") or slides.get("PAGE_1", "")
+
+    match = re.search(
+        r"team\s*name\s*[:\-–]\s*([^\n\r]{2,60})",
+        cover,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        candidate = match.group(1).strip()
+        if re.search(r"member|affiliation|india innovates", candidate, re.IGNORECASE):
+            pass
+        else:
             return candidate[:80]
+
+    boilerplate = {
+        "team name",
+        "team name:",
+        "members name and affiliation:",
+        "india innovates 2026",
+        "india innovates",
+        "thank you",
+    }
+    for line in cover.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower() in boilerplate:
+            continue
+        if re.match(r"^(team|member|affiliation|domain|problem)", stripped, re.IGNORECASE):
+            continue
+        if len(stripped) < 2:
+            continue
+        return stripped[:80]
+
     return "Unknown Team"
 
 
@@ -716,17 +904,25 @@ def validate_score_value(value: Any, key_name: str) -> int:
     return value
 
 
-def compute_final_score(media_raw: int, proto_raw: int, ppt_raw: int, align_raw: int) -> dict[str, float]:
-    media_score = MEDIA_SCORE_MAP.get(media_raw, 0.0)
-    proto_score = PROTO_SCORE_MAP.get(proto_raw, 0.0)
-    ppt_score = PPT_SCORE_MAP.get(ppt_raw, 0.0)
-    align_score = ALIGN_SCORE_MAP.get(align_raw, 0.0)
-    total = round(min(media_score + proto_score + ppt_score + align_score, 1.0), 4)
+def compute_final_score(
+    media_raw: int,
+    proto_raw: int,
+    ppt_raw: int,
+    align_raw: int,
+    visual_bonus_raw: int,
+) -> dict[str, float]:
+    media_q = MEDIA_SCORE_MAP.get(media_raw, 0.0)
+    proto_q = PROTO_SCORE_MAP.get(proto_raw, 0.0)
+    ppt_q = PPT_SCORE_MAP.get(ppt_raw, 0.0)
+    align_q = ALIGN_SCORE_MAP.get(align_raw, 0.0)
+    visual_q = VISUAL_BONUS_MAP.get(visual_bonus_raw, 0.0)
+    total = round(min(media_q + proto_q + ppt_q + align_q + visual_q, 1.0), 4)
     return {
-        "media_score": media_score,
-        "proto_score": proto_score,
-        "ppt_score": ppt_score,
-        "align_score": align_score,
+        "media_score": media_q,
+        "proto_score": proto_q,
+        "ppt_score": ppt_q,
+        "align_score": align_q,
+        "visual_score": visual_q,
         "total": total,
     }
 
@@ -762,10 +958,10 @@ def parse_and_validate_llm_response(raw_content: str) -> dict[str, Any]:
 def request_openai_completion(client: OpenAI, messages: list[dict[str, str]], model: str) -> str:
     response = client.chat.completions.create(
         model=model,
-        temperature=0,
-        max_tokens=RESERVED_OUTPUT_TOKENS,
+        temperature=0.0,
+        max_completion_tokens=RESERVED_OUTPUT_TOKENS,
         response_format={"type": "json_object"},
-        messages=messages,
+        messages=cast(Any, messages),
     )
     raw_content = response.choices[0].message.content
     if not raw_content:
@@ -806,7 +1002,7 @@ def safe_call_openai(user_prompt: str, api_key: str, model: str) -> dict[str, An
             if attempt == 2:
                 return error_result("Rate limit hit after 3 attempts.")
             time.sleep(8 * (attempt + 1))
-        except (APIError, json.JSONDecodeError, ValueError) as exc:
+        except (APIConnectionError, APIStatusError, json.JSONDecodeError, ValueError) as exc:
             if attempt == 2:
                 return error_result(str(exc))
             time.sleep(2 * (attempt + 1))
@@ -821,10 +1017,11 @@ def ensure_submission_defaults(
     sid: str,
     file_name: str,
     submission_hash_value: str,
+    submission_url: str = "",
 ) -> dict[str, Any]:
-    extracted = extract_ppt_text(file_bytes)
-    slide_map = extracted["slide_map"]
-    team_name = extract_team_name(slide_map)
+    extracted_map = extract_submission(file_bytes, file_name)
+    slide_entries, slide_map = build_slide_entries(extracted_map)
+    team_name = try_extract_team_name(slide_map)
     default_domain = ALL_DOMAINS[0]
     default_ps_key = list(PROBLEM_STATEMENTS[default_domain].keys())[0]
 
@@ -833,6 +1030,7 @@ def ensure_submission_defaults(
         "submission_hash": submission_hash_value,
         "file_name": file_name,
         "file_bytes": file_bytes,
+        "submission_url": submission_url,
         "team_name": team_name,
         "domain": default_domain,
         "ps_key": default_ps_key,
@@ -841,8 +1039,9 @@ def ensure_submission_defaults(
         "github_link": "",
         "media_rating": 0,
         "proto_rating": 0,
+        "visual_rating": 0,
         "slide_map": slide_map,
-        "slides": extracted["slides"],
+        "slides": slide_entries,
         "ppt_payload": None,
         "present_required": [],
         "missing_required": [],
@@ -862,7 +1061,7 @@ def ensure_submission_defaults(
     merged["file_name"] = file_name
     merged["file_bytes"] = file_bytes
     merged["slide_map"] = slide_map
-    merged["slides"] = extracted["slides"]
+    merged["slides"] = slide_entries
     if not merged.get("team_name") or merged["team_name"] == "Unknown Team":
         merged["team_name"] = team_name
     merged["ppt_payload"], merged["present_required"], merged["missing_required"] = build_llm_ppt_payload(slide_map)
@@ -875,7 +1074,7 @@ def render_slide_preview(submission: dict[str, Any], sid: str) -> None:
         slide_text = slide.get("text", "") or "<EMPTY>"
         preview_lines.append(f"[{slide['index']}] {slide['label']}\n{slide_text}")
     st.text_area(
-        "Extracted PPT text",
+        "Extracted submission text",
         value="\n\n".join(preview_lines),
         key=f"preview_{sid}",
         height=260,
@@ -894,6 +1093,7 @@ def build_result_row(
     p_q: float,
     ppt_q: float | None,
     al_q: float | None,
+    visual_q: float | None,
 ) -> dict[str, Any]:
     local_flags = list(llm_result.get("red_flags", []))
     if submission.get("missing_required"):
@@ -908,6 +1108,7 @@ def build_result_row(
     return {
         "Submission ID": sid,
         "Submission Hash": submission.get("submission_hash", ""),
+        "Submission URL": submission.get("submission_url", ""),
         "File": submission.get("file_name", ""),
         "Team": submission.get("team_name", ""),
         "Domain": submission.get("domain", ""),
@@ -919,6 +1120,8 @@ def build_result_row(
         "Media Score": m_q,
         "Prototype Raw": submission.get("proto_rating", 0),
         "Prototype Score": p_q,
+        "Visual Raw": submission.get("visual_rating", 0),
+        "Visual Score": visual_q,
         "PPT Raw": llm_result.get("ppt_score_raw"),
         "PPT Score": ppt_q,
         "Alignment Raw": llm_result.get("alignment_score_raw"),
@@ -948,7 +1151,7 @@ def highlight_eval_failed(row: pd.Series) -> list[str]:
 init_db()
 st.set_page_config(page_title="India Innovates 2026 Evaluator", page_icon="🇮🇳", layout="wide")
 
-for key, default in (("submissions", {}), ("results", [])):
+for key, default in (("submissions", {}), ("results", []), ("url_downloads", {})):
     if key not in st.session_state:
         st.session_state[key] = default
 st.session_state.setdefault("failed_uploads", {})
@@ -959,19 +1162,24 @@ with st.sidebar:
     st.divider()
 
     api_key = st.text_input("OpenAI API key", type="password", placeholder="sk-...")
-    model_choice = st.selectbox("Model", options=MODEL_OPTIONS, index=0)
+    model_choice = st.selectbox(
+        "Model",
+        options=["gpt-5-mini", "gpt-4.1-mini", "gpt-4.1", "gpt-4o", "gpt-4o-mini"],
+        index=0,
+    )
 
     st.divider()
     st.markdown("### Marking scheme in use")
     st.caption("Using the current per-question score tables and hard-gate rule from the scheme file.")
     st.markdown(
         """
-| Component | Raw values | Final score |
-|---|---|---|
-| Media | 0 / 1 / 5 | 0.00 / 0.10 / 0.25 |
-| Prototype + GitHub | 0 / 1 / 5 | 0.00 / 0.10 / 0.35 |
-| PPT Quality | 0 / 2 / 4 / 6 / 8 / 10 | 0.00 / 0.06 / 0.12 / 0.18 / 0.24 / 0.30 |
-| PS Alignment | 0 / 2 / 4 / 6 / 8 / 10 | 0.00 / 0.00 / 0.10 / 0.18 / 0.28 / 0.35 |
+| Icon | Component | Max final score | Reviewer | Notes |
+|---|---|---:|---|---|
+| 🎥 | Media | 0.25 | 👤 You | Optional |
+| 🧪 | Prototype + GitHub | 0.35 | 👤 You | Hard gate at 0 |
+| 🎨 | Visual bonus | +0.10 | 👤 You | Optional |
+| 📝 | PPT Quality | 0.30 | 🤖 LLM | Required |
+| 🎯 | PS Alignment | 0.35 | 🤖 LLM | Required |
 
 **Hard gate:** Prototype + GitHub rating `0` → auto-OUT, skip LLM  
 **IN threshold:** 0.60  
@@ -979,21 +1187,53 @@ with st.sidebar:
         """
     )
 
-st.title("🇮🇳 India Innovates 2026 — Screening Evaluator")
-st.caption("Upload PPTs, fill human review inputs, run LLM scoring, then export CSV.")
 
-st.header("Step 1 · Upload PPT batch", divider="gray")
+st.title("🇮🇳 India Innovates 2026 — Screening Evaluator")
+st.caption("Upload PDF / PPTX files (or paste a URL), fill human review inputs, run LLM scoring, then export CSV.")
+
+st.header("Step 1 · Upload submissions", divider="gray")
 uploaded_files = st.file_uploader(
-    f"Upload up to {MAX_FILES_BATCH} PPTX files",
-    type=["pptx"],
+    f"Upload up to {MAX_FILES_BATCH} PDF / PPTX files",
+    type=["pdf", "pptx", "ppt"],
     accept_multiple_files=True,
 )
 
-if not uploaded_files:
-    st.info("Upload one or more .pptx submissions to begin.")
+# ── URL download section ─────────────────────────────────────────────
+st.markdown("**Or add a submission via direct URL**")
+_url_col, _btn_col = st.columns([3, 1])
+with _url_col:
+    _url_input = st.text_input(
+        "Paste a direct link to a .pdf / .pptx file",
+        key="submission_url_input",
+        placeholder="https://cloudfront.example.com/team_submission.pptx",
+    )
+with _btn_col:
+    st.markdown("<br>", unsafe_allow_html=True)
+    _url_btn = st.button("Download & extract", key="url_extract_btn", disabled=not _url_input)
+
+if _url_btn and _url_input:
+    with st.spinner("Downloading file from URL…"):
+        try:
+            _url_bytes, _url_fname = fetch_file_from_url(_url_input)
+            detect_format(_url_fname)
+            _url_sid = submission_id(_url_bytes, _url_fname)
+            st.session_state.url_downloads[_url_sid] = {
+                "sid": _url_sid,
+                "file_name": _url_fname,
+                "file_bytes": _url_bytes,
+                "submission_hash": full_submission_hash(_url_bytes, _url_fname),
+                "submission_url": _url_input,
+            }
+            st.success(f"Downloaded: {_url_fname}")
+        except ValueError as exc:
+            st.error(str(exc))
+
+has_any = bool(uploaded_files) or bool(st.session_state.url_downloads)
+if not has_any:
+    st.info("Upload or link one or more .pdf / .pptx submissions to begin.")
     st.markdown(
         """
-1. Upload PPT submissions.
+1. Upload PDF / PPTX submissions (or paste a download URL above).
 2. Confirm team, domain, and problem statement.
 3. Add human-reviewed media / prototype / GitHub inputs.
 4. Run evaluation.
@@ -1002,28 +1242,37 @@ if not uploaded_files:
     )
     st.stop()
 
-if len(uploaded_files) > MAX_FILES_BATCH:
-    st.error(f"Maximum batch size is {MAX_FILES_BATCH}. You uploaded {len(uploaded_files)} files.")
-    st.stop()
-
 uploaded_entries: list[dict[str, Any]] = []
 seen_sids: set[str] = set()
-for uploaded_file in uploaded_files:
-    raw_bytes = uploaded_file.getvalue()
-    file_name = uploaded_file.name
-    sid = submission_id(raw_bytes, file_name)
-    if sid in seen_sids:
-        st.warning(f"Skipping duplicate upload instance for {file_name}.")
-        continue
-    seen_sids.add(sid)
-    uploaded_entries.append(
-        {
-            "sid": sid,
-            "file_name": file_name,
-            "file_bytes": raw_bytes,
-            "submission_hash": full_submission_hash(raw_bytes, file_name),
-        }
-    )
+
+if uploaded_files:
+    if len(uploaded_files) > MAX_FILES_BATCH:
+        st.error(f"Maximum batch size is {MAX_FILES_BATCH}. You uploaded {len(uploaded_files)} files.")
+        st.stop()
+
+    for uploaded_file in uploaded_files:
+        raw_bytes = uploaded_file.getvalue()
+        file_name = uploaded_file.name
+        sid = submission_id(raw_bytes, file_name)
+        if sid in seen_sids:
+            st.warning(f"Skipping duplicate upload instance for {file_name}.")
+            continue
+        seen_sids.add(sid)
+        uploaded_entries.append(
+            {
+                "sid": sid,
+                "file_name": file_name,
+                "file_bytes": raw_bytes,
+                "submission_hash": full_submission_hash(raw_bytes, file_name),
+                "submission_url": "",
+            }
+        )
+
+# Merge URL-downloaded submissions
+for _u_sid, _u_entry in st.session_state.url_downloads.items():
+    if _u_sid not in seen_sids:
+        seen_sids.add(_u_sid)
+        uploaded_entries.append(_u_entry)
 
 current_sids = {entry["sid"] for entry in uploaded_entries}
 for stale_sid in list(st.session_state.submissions.keys()):
@@ -1041,13 +1290,15 @@ for entry in uploaded_entries:
     try:
         if len(raw_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
             raise ValueError(f"File exceeds {MAX_UPLOAD_MB}MB limit")
-        st.session_state.submissions[sid] = ensure_submission_defaults(
-            existing,
-            raw_bytes,
-            sid,
-            file_name,
-            entry["submission_hash"],
-        )
+        with st.spinner(f"Extracting text from {file_name}..."):
+            st.session_state.submissions[sid] = ensure_submission_defaults(
+                existing,
+                raw_bytes,
+                sid,
+                file_name,
+                entry["submission_hash"],
+                submission_url=entry.get("submission_url", ""),
+            )
         st.session_state.failed_uploads.pop(sid, None)
     except Exception as exc:  # noqa: BLE001
         st.session_state.failed_uploads[sid] = str(exc)
@@ -1144,6 +1395,20 @@ for entry in uploaded_entries:
                 format_func=lambda value: {0: "0 · Missing", 1: "1 · Weak", 5: "5 · Strong"}[value],
             )
 
+        visual_r = st.radio(
+            "🎨 Visual richness bonus — graphs, diagrams, polished design (optional, human-only)",
+            options=[0, 1, 2],
+            horizontal=True,
+            index=[0, 1, 2].index(submission.get("visual_rating", 0)),
+            key=f"visual_{sid}",
+            format_func=lambda value: {
+                0: "0 · Nothing extra",
+                1: "1 · +0.05 · Some graphs / decent design",
+                2: "2 · +0.10 · Exceptional visuals / architecture diagrams",
+            }[value],
+        )
+        submission["visual_rating"] = visual_r
+
         action_col, status_col = st.columns([1, 2])
         with action_col:
             st.caption("Extraction is cached and refreshes automatically when the uploaded file changes.")
@@ -1157,7 +1422,7 @@ for entry in uploaded_entries:
                 f"Prompt payload tokens: {token_count}/{MAX_PPT_TOKENS}"
             )
 
-        with st.expander("Extracted PPT preview", expanded=False):
+        with st.expander("Extracted text preview", expanded=False):
             render_slide_preview(submission, sid)
 
         if submission.get("last_result_row"):
@@ -1169,7 +1434,8 @@ for entry in uploaded_entries:
                 st.markdown(f"**Last score:** total **{format_score(last_result['TOTAL'])}** → {verdict_label}")
             st.caption(
                 f"Media {format_score(last_result['Media Score'])} · Prototype {format_score(last_result['Prototype Score'])} · "
-                f"PPT {format_score(last_result['PPT Score'])} · Alignment {format_score(last_result['Alignment Score'])}"
+                f"Visual {format_score(last_result['Visual Score'])} · PPT {format_score(last_result['PPT Score'])} · "
+                f"Alignment {format_score(last_result['Alignment Score'])}"
             )
 
 st.header("Step 3 · Run LLM evaluation", divider="gray")
@@ -1212,6 +1478,7 @@ else:
                 ps_text = PROBLEM_STATEMENTS[domain][ps_key]
                 media_score = MEDIA_SCORE_MAP.get(submission.get("media_rating", 0), 0.0)
                 proto_score = PROTO_SCORE_MAP.get(submission.get("proto_rating", 0), 0.0)
+                visual_score = VISUAL_BONUS_MAP.get(submission.get("visual_rating", 0), 0.0)
                 submission["prompt_red_flags"] = []
 
                 if submission.get("proto_rating", 0) == 0:
@@ -1233,6 +1500,7 @@ else:
                         proto_score,
                         0.0,
                         0.0,
+                        visual_score,
                     )
                 else:
                     sanitized_payload, stripped_lines = sanitize_ppt_content_for_prompt(submission["ppt_payload"])
@@ -1271,6 +1539,7 @@ else:
                             proto_score,
                             None,
                             None,
+                            visual_score,
                         )
                     else:
                         scores = compute_final_score(
@@ -1278,6 +1547,7 @@ else:
                             submission["proto_rating"],
                             llm_result["ppt_score_raw"],
                             llm_result["alignment_score_raw"],
+                            submission.get("visual_rating", 0),
                         )
                         verdict = "IN" if scores["total"] >= IN_THRESHOLD else "OUT"
                         result_row = build_result_row(
@@ -1291,6 +1561,7 @@ else:
                             scores["proto_score"],
                             scores["ppt_score"],
                             scores["align_score"],
+                            scores["visual_score"],
                         )
 
                 submission["llm_result"] = llm_result
@@ -1309,6 +1580,7 @@ else:
                             "proto_score": result_row["Prototype Score"],
                             "ppt_score": result_row["PPT Score"],
                             "align_score": result_row["Alignment Score"],
+                            "visual_score": result_row["Visual Score"],
                             "total_score": result_row["TOTAL"],
                             "ppt_verdict": result_row["PPT Verdict"],
                             "align_verdict": result_row["Alignment Verdict"],
@@ -1333,6 +1605,7 @@ else:
                     PROTO_SCORE_MAP.get(submission.get("proto_rating", 0), 0.0),
                     None,
                     None,
+                    VISUAL_BONUS_MAP.get(submission.get("visual_rating", 0), 0.0),
                 )
                 submission["llm_result"] = llm_result
                 submission["last_result_row"] = result_row
@@ -1369,8 +1642,8 @@ if st.session_state.results:
             st.markdown(f"**{icon} {row['Team']}** — {row['File']}")
             st.write(
                 f"Total: {format_score(row['TOTAL'])} | Media: {format_score(row['Media Score'])} | "
-                f"Prototype: {format_score(row['Prototype Score'])} | PPT: {format_score(row['PPT Score'])} | "
-                f"Alignment: {format_score(row['Alignment Score'])}"
+                f"Prototype: {format_score(row['Prototype Score'])} | Visual: {format_score(row['Visual Score'])} | "
+                f"PPT: {format_score(row['PPT Score'])} | Alignment: {format_score(row['Alignment Score'])}"
             )
             st.caption(f"Verdict: {row['VERDICT']} | Status: {row['Eval Status']}")
             st.caption(f"PPT: {row['PPT Verdict']}")
@@ -1392,9 +1665,31 @@ if st.session_state.results:
         st.session_state.submissions = {}
         st.session_state.results = []
         st.session_state.failed_uploads = {}
+        st.session_state.url_downloads = {}
         st.rerun()
 
 with st.expander("📋 All Selected Participants (this event)"):
+    def get_encrypted_db_zip() -> bytes:
+        """Read selected.db and return it as an AES-encrypted zip in memory."""
+        # TODO: verify manually against current pyzipper docs once Context7 coverage is available.
+        try:
+            import pyzipper
+        except ImportError as exc:
+            raise ValueError("Encrypted DB download unavailable — install pyzipper") from exc
+
+        db_bytes = DB_PATH.read_bytes()
+        buffer = BytesIO()
+        with pyzipper.AESZipFile(
+            buffer,
+            "w",
+            # TODO: verify manually against current pyzipper docs once Context7 coverage is available.
+            compression=pyzipper.ZIP_DEFLATED,
+            encryption=pyzipper.WZ_AES,
+        ) as zf:
+            zf.setpassword(DB_DOWNLOAD_PASSWORD)
+            zf.writestr("selected.db", db_bytes)
+        return buffer.getvalue()
+
     connection: sqlite3.Connection | None = None
     try:
         connection = get_db_connection()
@@ -1414,10 +1709,16 @@ with st.expander("📋 All Selected Participants (this event)"):
             use_container_width=True,
             hide_index=True,
         )
-        st.download_button(
-            "Download selected participants CSV",
-            data=selected_df.to_csv(index=False).encode("utf-8"),
-            file_name="selected_participants.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+        try:
+            encrypted_db_zip = get_encrypted_db_zip()
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            st.download_button(
+                label="⬇️ Download selected.db (password protected)",
+                data=encrypted_db_zip,
+                file_name="selected_participants.zip",
+                mime="application/zip",
+                use_container_width=True,
+            )
+            st.caption("🔒 Password: yash<3akshat")

@@ -1,0 +1,2 @@
+apt-get install -y tesseract-ocr poppler-utils
+pip install pypdf>=4.0 pdfplumber pillow pytesseract pdf2image pyzipper
