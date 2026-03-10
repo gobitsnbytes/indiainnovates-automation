@@ -956,9 +956,9 @@ with st.sidebar:
     )
 
 st.title("🇮🇳 India Innovates 2026 — Screening Evaluator")
-st.caption("Upload PPTs, fill human review inputs, run LLM scoring, then export CSV.")
+st.caption("Upload PDFs, fill human review inputs, run LLM scoring, then export CSV.")
 
-st.header("Step 1 · Upload PPT batch", divider="gray")
+st.header("Step 1 · Upload PDF batch", divider="gray")
 uploaded_files = st.file_uploader(
     f"Upload up to {MAX_FILES_BATCH} PDF files",
     type=["pdf"],
@@ -969,7 +969,7 @@ if not uploaded_files:
     st.info("Upload one or more .pdf submissions to begin.")
     st.markdown(
         """
-1. Upload PPT submissions.
+1. Upload PDF submissions.
 2. Confirm team, domain, and problem statement.
 3. Add human-reviewed media / prototype / GitHub inputs.
 4. Run evaluation.
