@@ -851,7 +851,7 @@ def render_slide_preview(submission: dict[str, Any], sid: str) -> None:
         slide_text = slide.get("text", "") or "<EMPTY>"
         preview_lines.append(f"[{slide['index']}] {slide['label']}\n{slide_text}")
     st.text_area(
-        "Extracted PPT text",
+        "Extracted PDF text",
         value="\n\n".join(preview_lines),
         key=f"preview_{sid}",
         height=260,
@@ -1133,7 +1133,7 @@ for entry in uploaded_entries:
                 f"Prompt payload tokens: {token_count}/{MAX_PPT_TOKENS}"
             )
 
-        with st.expander("Extracted PPT preview", expanded=False):
+        with st.expander("Extracted PDF preview", expanded=False):
             render_slide_preview(submission, sid)
 
         if submission.get("last_result_row"):
