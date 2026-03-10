@@ -39,7 +39,7 @@ cd ~/indiainnovates-automation
 python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
-pip install streamlit python-pptx openai tiktoken pandas
+pip install streamlit pypdf openai tiktoken pandas
 ```
 
 ## 5. Configure the API key

@@ -104,7 +104,7 @@ ssh root@<your-droplet-ip>
 # 2. Set up environment
 python3 -m venv venv
 source venv/bin/activate
-pip install streamlit python-pptx openai tiktoken pandas
+pip install streamlit pypdf openai tiktoken pandas
 
 # 3. Clone / copy app.py to droplet
 # (use scp or git)
@@ -127,7 +127,7 @@ Access via `http://<your-droplet-ip>:8501`
 
 ```
 streamlit>=1.35
-python-pptx>=0.6.23
+pypdf>=4.0
 openai>=1.30
 tiktoken>=0.7
 pandas>=2.0

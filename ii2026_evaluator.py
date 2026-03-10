@@ -17,7 +17,6 @@ import hashlib
 import json
 import sqlite3
 import time
-import zipfile
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -26,7 +25,7 @@ import pandas as pd
 import streamlit as st
 import tiktoken
 from openai import APIError, OpenAI, RateLimitError
-from pptx import Presentation
+from pypdf import PdfReader
 
 IN_THRESHOLD = 0.60
 MAX_FILES_BATCH = 10
@@ -553,57 +552,34 @@ def truncate_slide_entries(slide_entries: list[dict[str, Any]], max_chars: int) 
     return truncated_entries
 
 
-def extract_text_from_shape(shape: Any) -> list[str]:
-    lines: list[str] = []
-
-    if getattr(shape, "has_text_frame", False):
-        text_frame = getattr(shape, "text_frame", None)
-        if text_frame is not None:
-            for paragraph in text_frame.paragraphs:
-                paragraph_text = " ".join(run.text.strip() for run in paragraph.runs if run.text.strip())
-                if not paragraph_text:
-                    paragraph_text = paragraph.text.strip()
-                if paragraph_text:
-                    lines.append(paragraph_text)
-
-    if getattr(shape, "has_table", False):
-        table = getattr(shape, "table", None)
-        if table is not None:
-            for row in table.rows:
-                cell_values = [normalize_whitespace(cell.text) for cell in row.cells if normalize_whitespace(cell.text)]
-                if cell_values:
-                    lines.append(" | ".join(cell_values))
-
-    return lines
-
-
 @st.cache_data(show_spinner=False)
 def extract_ppt_text(file_bytes: bytes) -> dict[str, Any]:
     if len(file_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
         raise ValueError(f"File exceeds {MAX_UPLOAD_MB}MB limit")
 
     try:
-        presentation = Presentation(BytesIO(file_bytes))
-    except zipfile.BadZipFile as exc:
-        raise ValueError("Invalid PPTX file: bad ZIP container") from exc
-    except KeyError as exc:
-        raise ValueError("Invalid PPTX file: missing internal structure") from exc
+        reader = PdfReader(BytesIO(file_bytes))
     except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"Invalid PPTX file: {exc}") from exc
+        raise ValueError(f"Could not read PDF: {exc}") from exc
+
+    if reader.is_encrypted:
+        raise ValueError("PDF is encrypted — cannot extract text")
+
+    if len(reader.pages) == 0:
+        raise ValueError("PDF has no pages")
 
     slide_entries: list[dict[str, Any]] = []
 
-    for index, slide in enumerate(presentation.slides, start=1):
-        label = SLIDE_LABELS[index - 1] if index - 1 < len(SLIDE_LABELS) else f"SLIDE_{index}"
-        lines: list[str] = []
-        for shape in slide.shapes:
-            lines.extend(extract_text_from_shape(shape))
+    for index, page in enumerate(reader.pages):
+        label = SLIDE_LABELS[index] if index < len(SLIDE_LABELS) else f"PAGE_{index + 1}"
+        raw_text = page.extract_text() or ""
+        text = normalize_whitespace(raw_text) if raw_text.strip() else "<NO TEXT ON PAGE>"
 
         slide_entries.append(
             {
-                "index": index,
+                "index": index + 1,
                 "label": label,
-                "text": normalize_whitespace("\n".join(lines)),
+                "text": text,
             }
         )
 
@@ -984,13 +960,13 @@ st.caption("Upload PPTs, fill human review inputs, run LLM scoring, then export 
 
 st.header("Step 1 · Upload PPT batch", divider="gray")
 uploaded_files = st.file_uploader(
-    f"Upload up to {MAX_FILES_BATCH} PPTX files",
-    type=["pptx"],
+    f"Upload up to {MAX_FILES_BATCH} PDF files",
+    type=["pdf"],
     accept_multiple_files=True,
 )
 
 if not uploaded_files:
-    st.info("Upload one or more .pptx submissions to begin.")
+    st.info("Upload one or more .pdf submissions to begin.")
     st.markdown(
         """
 1. Upload PPT submissions.

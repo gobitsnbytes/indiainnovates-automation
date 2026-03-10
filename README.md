@@ -25,7 +25,7 @@ Create a `requirements.txt`:
 
 ```
 streamlit>=1.35
-python-pptx>=0.6.23
+pypdf>=4.0
 openai>=1.30
 tiktoken>=0.7
 pandas>=2.0
