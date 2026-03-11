@@ -20,8 +20,10 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -90,8 +92,11 @@ SAFETY_MARGIN_TOKENS = 500
 MAX_EXTRACTED_CHARS = 200_000
 INJECTION_PATTERNS = ["ignore", "disregard", "system:", "assistant:", "[inst]", "###"]
 SUPPORTED_EXTENSIONS = {".pdf", ".pptx", ".ppt"}
+PRESENTATION_EXTENSIONS = {".ppt", ".pptx"}
 LINK_TIMEOUT_SECONDS = 30
 MAX_DOWNLOAD_MB = 50
+PRESENTATION_CONVERSION_TIMEOUT_SECONDS = 120
+SOFFICE_CANDIDATES = ["soffice", "soffice.com", "libreoffice"]
 CSV_URL_COLUMN = "Q1: Upload your presentation."
 CSV_TEAM_COLUMN = "Team Name"
 CSV_DOMAIN_COLUMN = "Domain"
@@ -434,6 +439,82 @@ DOMAIN_HINT_ALIASES = {
     ],
 }
 
+PROBLEM_STATEMENT_HINT_ALIASES = {
+    "Domain 1 — Urban Solutions": {
+        "1A · Urban Flooding & Hydrology Engine": [
+            "1a",
+            "urban flooding",
+            "hydrology engine",
+            "flood",
+            "flooding",
+            "drainage",
+            "monsoon",
+            "waterlogging",
+            "micro hotspot",
+            "pre monsoon readiness",
+        ],
+        "1B · Hyper-Local AQI & Pollution Mitigation Dashboard": [
+            "1b",
+            "aqi",
+            "air quality",
+            "pollution",
+            "pollution mitigation",
+            "construction dust",
+            "biomass burning",
+            "health advisory",
+        ],
+        "1C · AI-Driven Circular Waste Intelligence System": [
+            "1c",
+            "waste",
+            "waste segregation",
+            "circular waste",
+            "garbage",
+            "garbage system",
+            "smart garbage",
+            "waste management",
+            "hazardous waste",
+            "recyclable",
+            "biodegradable",
+            "route optimization",
+        ],
+        "1D · Dynamic AI Traffic Flow Optimizer & Emergency Grid": [
+            "1d",
+            "traffic",
+            "signal timing",
+            "green corridor",
+            "ambulance",
+            "emergency vehicle",
+            "traffic flow",
+        ],
+    },
+    "Domain 2 — Digital Democracy": {
+        "2A · Global Ontology / Intelligence Graph Engine": ["2a", "ontology", "intelligence graph", "knowledge graph", "graph engine"],
+        "2B · AI-Driven Booth Management System": ["2b", "booth management", "voter", "voter list", "booth level", "beneficiary linkage"],
+        "2C · Hyper-Local Targeting Engine (Geo-fencing)": ["2c", "geo fencing", "geofencing", "geo fence", "location based", "notification", "hyper local targeting"],
+        "2D · Secure Blockchain E-Voting System": ["2d", "e voting", "evoting", "voting", "blockchain voting", "ballot"],
+        "2E · AI-Powered Avatar Platform": ["2e", "avatar", "digital avatar", "interactive avatar", "multilingual avatar"],
+        "2F · AI Inbound & Outbound Calling Agent": ["2f", "calling agent", "call agent", "voice bot", "outbound calling", "inbound calling"],
+        "2G · Smart Public Service CRM (PS-CRM)": ["2g", "crm", "grievance", "complaint", "ticketing", "public service crm", "municipal complaint", "complaint intelligence", "proof based municipal complaint intelligence", "public complaint"],
+        "2H · AI Co-Pilot for Public Leaders & Administrators": ["2h", "co pilot", "copilot", "speech drafting", "constituency", "public leaders", "politicopilot", "civicmind", "governance operating system", "political ai", "politicalai"],
+        "2I · Party Worker Management System": ["2i", "worker management", "party worker", "campaign execution", "outreach"],
+        "2J · AI Sentiment Analysis Engine": ["2j", "sentiment", "opinion mining", "social media", "heatmap", "constituency wise", "data mining", "democracy and governance", "processing for democracy and governance"],
+    },
+    "Domain 3 — Open Innovation": {
+        "3A · Open Innovation — Healthcare": ["3a", "healthcare", "health", "medical", "hospital", "diagnosis", "patient", "femtech", "medtech", "medipredict", "medosphere", "wombelle", "cervicare", "genomitra", "care"],
+        "3B · Open Innovation — Robotics": ["3b", "robotics", "robot", "drone", "automation", "autonomous"],
+        "3C · Open Innovation — Agriculture": ["3c", "agriculture", "agri", "farming", "farm", "crop", "soil", "irrigation", "kisan", "kisan sathi"],
+        "3D · Open Innovation — FinTech": ["3d", "fintech", "finance", "banking", "credit", "payment", "insurance"],
+        "3E · Open Innovation — DeepTech": ["3e", "deeptech", "deep tech", "semiconductor", "quantum", "advanced materials", "space tech"],
+        "3F · Open Innovation — Cybersecurity": ["3f", "cybersecurity", "cyber security", "infosec", "threat", "malware", "phishing", "zero trust", "sentinel", "security"],
+        "3G · Open Innovation — Blockchain": ["3g", "blockchain", "web3", "smart contract", "ledger", "token", "crypto", "encrypto"],
+        "3H · Open Innovation — AI/ML": ["3h", "ai ml", "aiml", "machine learning", "artificial intelligence", "llm", "neural network"],
+        "3I · Open Innovation — Sustainability": ["3i", "sustainability", "sustainable", "climate", "carbon", "energy", "renewable", "environment", "ev", "ev sphere", "carbon cents"],
+        "3J · Open Innovation — EdTech": ["3j", "edtech", "education", "learning", "student", "teacher", "classroom"],
+        "3K · Open Innovation — Smart Governance": ["3k", "smart governance", "governance", "civic", "government", "public administration", "civic tech", "politics and civic tech", "politics civic tech"],
+        "3L · Open Innovation — Other": ["3l", "other"],
+    },
+}
+
 
 def _normalize_match_text(text: str) -> str:
     normalized = text.lower()
@@ -455,6 +536,100 @@ def _match_tokens(text: str) -> set[str]:
 
 def _strip_ps_code(ps_key: str) -> str:
     return re.sub(r"^\s*[0-9]+[A-Z]\s*[·.:-]\s*", "", ps_key).strip()
+
+
+def infer_problem_statement_for_domain(
+    domain: str,
+    file_name: str,
+    team_name: str,
+    extracted_ps: str,
+    slides: dict[str, str],
+    extra_hint_text: str = "",
+    submission_url: str = "",
+) -> str | None:
+    statements = PROBLEM_STATEMENTS.get(domain, {})
+    if not statements:
+        return None
+
+    url_hint = Path(urlparse(submission_url).path).stem if submission_url else ""
+    slide_hint_parts = [slides.get("COVER / TEAM INFO", ""), slides.get("PROBLEM STATEMENT", "")]
+    if not any(slide_hint_parts):
+        slide_hint_parts.extend(list(slides.values())[:3])
+
+    hint_parts = [Path(file_name).stem, url_hint, team_name, extracted_ps, extra_hint_text, *slide_hint_parts]
+    hint_text = "\n".join(part for part in hint_parts if part)
+    normalized_hint = _normalize_match_text(hint_text)
+    padded_hint = f" {normalized_hint} "
+    hint_tokens = _match_tokens(hint_text)
+
+    ps_code_lookup = {
+        _normalize_match_text(ps_key.split("·", 1)[0]): ps_key
+        for ps_key in statements
+    }
+    explicit_code_match = re.search(r"\b([123][a-z])\b", normalized_hint)
+    if explicit_code_match:
+        explicit_ps = ps_code_lookup.get(explicit_code_match.group(1))
+        if explicit_ps is not None:
+            return explicit_ps
+
+    best_ps: tuple[int, str | None] = (-1, None)
+    domain_aliases = PROBLEM_STATEMENT_HINT_ALIASES.get(domain, {})
+    for ps_key, ps_text in statements.items():
+        title = _strip_ps_code(ps_key)
+        aliases = domain_aliases.get(ps_key, [])
+        score = 0
+
+        for alias in aliases:
+            alias_normalized = _normalize_match_text(alias)
+            if not alias_normalized:
+                continue
+            if f" {alias_normalized} " in padded_hint:
+                score += 18 if " " in alias_normalized else 10
+            else:
+                score += 2 * len(hint_tokens & _match_tokens(alias))
+
+        normalized_title = _normalize_match_text(title)
+        if normalized_title and f" {normalized_title} " in padded_hint:
+            score += 20
+
+        title_tokens = _match_tokens(title)
+        description_tokens = _match_tokens(ps_text)
+        score += 5 * len(hint_tokens & title_tokens)
+        score += 2 * len(hint_tokens & description_tokens)
+
+        if domain == "Domain 3 — Open Innovation" and ps_key.endswith("Other"):
+            score -= 3
+
+        if score > best_ps[0]:
+            best_ps = (score, ps_key)
+
+    if best_ps[1] is not None:
+        return best_ps[1]
+    return next(iter(statements))
+
+
+def infer_submission_mapping(
+    file_name: str,
+    team_name: str,
+    extracted_ps: str,
+    slides: dict[str, str],
+    raw_domain_hint: Any = "",
+    submission_url: str = "",
+) -> tuple[str, str]:
+    raw_hint_text = str(raw_domain_hint or "").strip()
+    domain_from_hint = infer_domain_from_csv_row(raw_hint_text, team_name, submission_url) if raw_hint_text else None
+    inferred_domain, inferred_ps = infer_domain_and_ps(file_name, team_name, extracted_ps, slides)
+    final_domain = domain_from_hint or inferred_domain or ALL_DOMAINS[0]
+    final_ps = infer_problem_statement_for_domain(
+        final_domain,
+        file_name,
+        team_name,
+        extracted_ps,
+        slides,
+        extra_hint_text=raw_hint_text,
+        submission_url=submission_url,
+    )
+    return final_domain, final_ps or inferred_ps or next(iter(PROBLEM_STATEMENTS[final_domain]))
 
 
 def infer_domain_and_ps(
@@ -531,7 +706,13 @@ def infer_domain_and_ps(
         return best_ps[1], best_ps[2]
 
     if inferred_domain:
-        return inferred_domain, list(PROBLEM_STATEMENTS[inferred_domain].keys())[0]
+        return inferred_domain, infer_problem_statement_for_domain(
+            inferred_domain,
+            file_name,
+            team_name,
+            extracted_ps,
+            slides,
+        )
 
     return None, None
 
@@ -854,6 +1035,21 @@ def resolve_submission_csv_path() -> Path:
 def infer_domain_from_csv_row(raw_domain: Any, team_name: str, submission_url: str) -> str:
     raw_text = str(raw_domain).strip()
     normalized_raw = _normalize_match_text(raw_text) if raw_text and raw_text.lower() != "nan" else ""
+    numeric_domain_map = {
+        "1": "Domain 1 — Urban Solutions",
+        "1.0": "Domain 1 — Urban Solutions",
+        "2": "Domain 2 — Digital Democracy",
+        "2.0": "Domain 2 — Digital Democracy",
+        "3": "Domain 3 — Open Innovation",
+        "3.0": "Domain 3 — Open Innovation",
+        "5": "Domain 3 — Open Innovation",
+        "5.0": "Domain 3 — Open Innovation",
+        "6": "Domain 2 — Digital Democracy",
+        "6.0": "Domain 2 — Digital Democracy",
+    }
+    if raw_text in numeric_domain_map:
+        return numeric_domain_map[raw_text]
+
     explicit_aliases = {
         "urban solutions": "Domain 1 — Urban Solutions",
         "urban solution": "Domain 1 — Urban Solutions",
@@ -916,10 +1112,15 @@ def load_pending_csv_submissions(current_batch_urls: set[str]) -> tuple[list[dic
         team_name = str(row.get(CSV_TEAM_COLUMN, "") or "").strip() or "Unknown Team"
         inferred_domain = infer_domain_from_csv_row(row.get(CSV_DOMAIN_COLUMN, ""), team_name, submission_url)
         source_file_name = Path(urlparse(submission_url).path).name or "submission"
-        inferred_ps_key = list(PROBLEM_STATEMENTS[inferred_domain].keys())[0]
-        _, inferred_specific_ps = infer_domain_and_ps(source_file_name, team_name, "", {})
-        if inferred_specific_ps in PROBLEM_STATEMENTS[inferred_domain]:
-            inferred_ps_key = inferred_specific_ps
+        inferred_ps_key = infer_problem_statement_for_domain(
+            inferred_domain,
+            source_file_name,
+            team_name,
+            "",
+            {},
+            extra_hint_text=str(row.get(CSV_DOMAIN_COLUMN, "") or ""),
+            submission_url=submission_url,
+        ) or list(PROBLEM_STATEMENTS[inferred_domain].keys())[0]
 
         deduped_rows.append(
             {
@@ -1794,11 +1995,20 @@ def ensure_submission_defaults(
     default_domain = ALL_DOMAINS[0]
     default_ps_key = list(PROBLEM_STATEMENTS[default_domain].keys())[0]
     inferred_domain, inferred_ps_key = infer_domain_and_ps(file_name, team_name, extracted_ps, slide_map)
-    initial_domain = inferred_domain or default_domain
-    initial_ps_key = inferred_ps_key or list(PROBLEM_STATEMENTS[initial_domain].keys())[0]
+    auto_domain, auto_ps_key = infer_submission_mapping(
+        file_name,
+        str(prefill.get("team_name", "") or team_name),
+        extracted_ps,
+        slide_map,
+        raw_domain_hint=prefill.get("raw_domain", ""),
+        submission_url=submission_url,
+    )
+    initial_domain = auto_domain or inferred_domain or default_domain
     prefill_domain = prefill.get("domain") if prefill.get("domain") in PROBLEM_STATEMENTS else None
     prefill_ps_options = PROBLEM_STATEMENTS.get(prefill_domain, {}) if prefill_domain else {}
     prefill_ps_key = prefill.get("ps_key") if prefill.get("ps_key") in prefill_ps_options else None
+    effective_domain = prefill_domain or initial_domain
+    initial_ps_key = prefill_ps_key or auto_ps_key or inferred_ps_key or list(PROBLEM_STATEMENTS[effective_domain].keys())[0]
     prefill_signature = json.dumps(prefill, sort_keys=True, ensure_ascii=False, default=str)
 
     base = {
@@ -1808,7 +2018,7 @@ def ensure_submission_defaults(
         "file_bytes": file_bytes,
         "submission_url": submission_url,
         "team_name": str(prefill.get("team_name", "") or team_name),
-        "domain": prefill_domain or initial_domain,
+        "domain": effective_domain,
         "ps_key": prefill_ps_key or initial_ps_key,
         "media_link": "",
         "prototype_link": "",
@@ -1819,6 +2029,9 @@ def ensure_submission_defaults(
         "regn_id": str(prefill.get("regn_id", "") or ""),
         "submission_timestamp": str(prefill.get("submission_timestamp", "") or ""),
         "raw_domain": str(prefill.get("raw_domain", "") or ""),
+        "auto_domain": auto_domain,
+        "auto_ps_key": auto_ps_key,
+        "mapping_override": False,
         "prefill_signature": prefill_signature,
         "slide_map": slide_map,
         "slides": slide_entries,
@@ -1850,6 +2063,8 @@ def ensure_submission_defaults(
     merged["extracted_ps"] = extracted_ps
     merged["previous_eval"] = previous_eval
     merged["prefill_signature"] = prefill_signature
+    merged["auto_domain"] = auto_domain
+    merged["auto_ps_key"] = auto_ps_key
     merged["submission_url"] = submission_url or merged.get("submission_url", "")
     if prefill.get("regn_id"):
         merged["regn_id"] = str(prefill.get("regn_id", ""))
@@ -1873,6 +2088,15 @@ def ensure_submission_defaults(
     if not valid_ps_options:
         merged["domain"] = default_domain
         valid_ps_options = PROBLEM_STATEMENTS[default_domain]
+    inferred_ps_for_merged_domain = infer_problem_statement_for_domain(
+        merged["domain"],
+        file_name,
+        merged.get("team_name", team_name),
+        extracted_ps,
+        slide_map,
+        extra_hint_text=str(merged.get("raw_domain", "") or ""),
+        submission_url=merged.get("submission_url", ""),
+    )
     if prefill_ps_key and prefill_ps_key in valid_ps_options:
         merged["ps_key"] = prefill_ps_key
     if (
@@ -1880,7 +2104,7 @@ def ensure_submission_defaults(
         or merged["ps_key"] not in valid_ps_options
         or (merged.get("domain") == (inferred_domain or merged.get("domain")) and merged.get("ps_key") == default_ps_key and inferred_ps_key)
     ):
-        merged["ps_key"] = inferred_ps_key or next(iter(valid_ps_options))
+        merged["ps_key"] = inferred_ps_for_merged_domain or inferred_ps_key or next(iter(valid_ps_options))
     merged["ppt_payload"], merged["present_required"], merged["missing_required"] = build_llm_ppt_payload(slide_map)
     if previous_eval is not None and not merged.get("llm_result"):
         merged["last_result_row"] = build_existing_result_row(sid, merged, previous_eval)
@@ -1961,31 +2185,92 @@ def format_score(value: Any) -> str:
     return f"{value:.2f}" if isinstance(value, (int, float)) else "—"
 
 
-def build_browser_open_url(submission: dict[str, Any]) -> str | None:
-    submission_url = str(submission.get("submission_url", "") or "").strip()
-    if submission_url:
-        return submission_url
+def _find_soffice_command() -> str | None:
+    for candidate in SOFFICE_CANDIDATES:
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return None
 
+
+@st.cache_data(show_spinner=False)
+def convert_presentation_to_pdf(file_bytes: bytes, file_name: str) -> bytes:
+    converter = _find_soffice_command()
+    if not converter:
+        raise ValueError("LibreOffice is required for browser preview of PPT/PPTX files.")
+
+    original_name = Path(file_name).name or "submission.pptx"
+    source_suffix = Path(original_name).suffix or ".pptx"
+
+    with tempfile.TemporaryDirectory(prefix="ii2026_preview_") as temp_dir:
+        temp_path = Path(temp_dir)
+        source_path = temp_path / f"source{source_suffix}"
+        source_path.write_bytes(file_bytes)
+
+        command = [
+            converter,
+            "--headless",
+            "--convert-to",
+            "pdf",
+            "--outdir",
+            str(temp_path),
+            str(source_path),
+        ]
+        try:
+            subprocess.run(  # noqa: S603
+                command,
+                check=True,
+                capture_output=True,
+                timeout=PRESENTATION_CONVERSION_TIMEOUT_SECONDS,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            raise ValueError("Failed to convert PPT/PPTX to PDF for browser preview.") from exc
+
+        pdf_path = source_path.with_suffix(".pdf")
+        if not pdf_path.exists():
+            raise ValueError("PDF preview file was not produced by LibreOffice.")
+        return pdf_path.read_bytes()
+
+
+def get_browser_open_pdf_bytes(submission: dict[str, Any]) -> bytes | None:
     file_name = str(submission.get("file_name", "") or "")
     file_ext = Path(file_name).suffix.lower()
     file_bytes = submission.get("file_bytes")
-    if file_ext != ".pdf" or not isinstance(file_bytes, bytes) or not file_bytes:
+    if not isinstance(file_bytes, bytes) or not file_bytes:
         return None
 
-    encoded_pdf = b64encode(file_bytes).decode("ascii")
+    if file_ext == ".pdf":
+        return file_bytes
+    if file_ext in PRESENTATION_EXTENSIONS:
+        return convert_presentation_to_pdf(file_bytes, file_name)
+    return None
+
+
+def build_browser_open_url(submission: dict[str, Any]) -> str | None:
+    submission_url = str(submission.get("submission_url", "") or "").strip()
+    file_name = str(submission.get("file_name", "") or "")
+    file_ext = Path(file_name).suffix.lower()
+    if submission_url and file_ext == ".pdf":
+        return submission_url
+
+    pdf_bytes = get_browser_open_pdf_bytes(submission)
+    if not pdf_bytes:
+        return None
+
+    encoded_pdf = b64encode(pdf_bytes).decode("ascii")
     return f"data:application/pdf;base64,{encoded_pdf}"
 
 
 def render_open_in_browser_link(submission: dict[str, Any], sid: str) -> None:
     submission_url = str(submission.get("submission_url", "") or "").strip()
-    if submission_url:
+    file_name = str(submission.get("file_name", "") or "")
+    file_ext = Path(file_name).suffix.lower()
+    if submission_url and file_ext == ".pdf":
         st.link_button("Open in browser ↗", submission_url, use_container_width=False)
         return
 
-    file_name = str(submission.get("file_name", "") or "")
-    file_ext = Path(file_name).suffix.lower()
-    if file_ext != ".pdf":
-        st.caption("Browser preview is available for source links and uploaded PDFs.")
+    if file_ext not in SUPPORTED_EXTENSIONS:
+        st.caption("Browser preview is available for PDFs and converted presentations.")
         return
 
     preview_state_key = f"browser_preview_ready_{sid}"
@@ -1993,12 +2278,20 @@ def render_open_in_browser_link(submission: dict[str, Any], sid: str) -> None:
         if st.button("Prepare browser tab ↗", key=f"prepare_browser_{sid}"):
             st.session_state[preview_state_key] = True
             st.rerun()
-        st.caption("PDF browser preview is prepared only when needed to keep the page fast.")
+        if file_ext in PRESENTATION_EXTENSIONS:
+            st.caption("Presentation preview is converted to PDF only when needed to keep the page fast.")
+        else:
+            st.caption("PDF browser preview is prepared only when needed to keep the page fast.")
         return
 
-    open_url = build_browser_open_url(submission)
+    try:
+        open_url = build_browser_open_url(submission)
+    except ValueError as exc:
+        st.caption(str(exc))
+        return
+
     if not open_url:
-        st.caption("Browser preview is available for source links and uploaded PDFs.")
+        st.caption("Browser preview is available for PDFs and converted presentations.")
         return
 
     st.markdown(
@@ -2292,11 +2585,109 @@ for entry in uploaded_entries:
 
 st.header("Step 2 · Human review inputs", divider="gray")
 st.info(
-    "Compact mode is on: changes are applied only when you click Save review inputs or Evaluate all submissions. This avoids slow reruns on every click."
+    "Domain and problem statement are auto-detected by default. Turn on override only when you want to correct them manually."
 )
 
 trigger = False
 saved_inputs = False
+
+st.markdown("#### Routing")
+for entry in uploaded_entries:
+    sid = entry["sid"]
+    file_name = entry["file_name"]
+
+    if sid in st.session_state.failed_uploads:
+        continue
+
+    submission = st.session_state.submissions.get(sid)
+    if submission is None:
+        continue
+
+    with st.expander(f"Routing · {file_name} · Team: {submission['team_name']}", expanded=False):
+        basic_info_bits = []
+        if submission.get("regn_id"):
+            basic_info_bits.append(f"Regn ID: {submission['regn_id']}")
+        if submission.get("submission_timestamp"):
+            basic_info_bits.append(f"Submitted: {submission['submission_timestamp']}")
+        if submission.get("raw_domain"):
+            basic_info_bits.append(f"CSV domain: {submission['raw_domain']}")
+        if submission.get("submission_url"):
+            basic_info_bits.append("Loaded from server CSV")
+        if basic_info_bits:
+            st.caption(" · ".join(basic_info_bits))
+
+        auto_domain, auto_ps_key = infer_submission_mapping(
+            file_name,
+            submission.get("team_name", ""),
+            submission.get("extracted_ps", ""),
+            submission.get("slide_map", {}),
+            raw_domain_hint=submission.get("raw_domain", ""),
+            submission_url=submission.get("submission_url", ""),
+        )
+        submission["auto_domain"] = auto_domain
+        submission["auto_ps_key"] = auto_ps_key
+
+        override_key = f"mapping_override_{sid}"
+        if override_key not in st.session_state:
+            st.session_state[override_key] = bool(submission.get("mapping_override", False))
+        submission["mapping_override"] = st.checkbox(
+            "Override auto-mapping",
+            key=override_key,
+            help="Leave this off to use the detected domain and problem statement.",
+        )
+
+        if not submission.get("mapping_override", False):
+            submission["domain"] = auto_domain
+            submission["ps_key"] = auto_ps_key
+            st.success(f"Auto-mapped domain: {auto_domain}")
+            st.caption(f"Auto-mapped problem statement: {auto_ps_key}")
+            st.caption(PROBLEM_STATEMENTS[auto_domain][auto_ps_key])
+        else:
+            domain_widget_key = f"domain_{sid}"
+            ps_widget_key = f"ps_{sid}"
+            initial_domain = submission["domain"] if submission.get("domain") in ALL_DOMAINS else auto_domain
+            if st.session_state.get(domain_widget_key) not in ALL_DOMAINS:
+                st.session_state[domain_widget_key] = initial_domain
+
+            route_col_1, route_col_2 = st.columns([1.05, 1.95])
+            with route_col_1:
+                selected_domain = st.selectbox(
+                    "Domain",
+                    options=ALL_DOMAINS,
+                    key=domain_widget_key,
+                )
+                submission["domain"] = selected_domain
+
+            ps_options = list(PROBLEM_STATEMENTS[selected_domain].keys())
+            inferred_ps_for_selected_domain = infer_problem_statement_for_domain(
+                selected_domain,
+                file_name,
+                submission.get("team_name", ""),
+                submission.get("extracted_ps", ""),
+                submission.get("slide_map", {}),
+                extra_hint_text=str(submission.get("raw_domain", "") or ""),
+                submission_url=submission.get("submission_url", ""),
+            )
+            preferred_ps = submission.get("ps_key")
+            if st.session_state.get(ps_widget_key) not in ps_options:
+                st.session_state[ps_widget_key] = (
+                    preferred_ps
+                    if preferred_ps in ps_options
+                    else inferred_ps_for_selected_domain
+                    if inferred_ps_for_selected_domain in ps_options
+                    else ps_options[0]
+                )
+
+            with route_col_2:
+                selected_ps = st.selectbox(
+                    "Problem statement",
+                    options=ps_options,
+                    key=ps_widget_key,
+                )
+                submission["ps_key"] = selected_ps
+                st.caption(PROBLEM_STATEMENTS[selected_domain][selected_ps])
+
+st.markdown("#### Compact review form")
 
 with st.form("review_inputs_form", clear_on_submit=False):
     for entry in uploaded_entries:
@@ -2313,18 +2704,6 @@ with st.form("review_inputs_form", clear_on_submit=False):
             continue
 
         with st.expander(f"{file_name} · Team: {submission['team_name']}", expanded=False):
-            basic_info_bits = []
-            if submission.get("regn_id"):
-                basic_info_bits.append(f"Regn ID: {submission['regn_id']}")
-            if submission.get("submission_timestamp"):
-                basic_info_bits.append(f"Submitted: {submission['submission_timestamp']}")
-            if submission.get("raw_domain"):
-                basic_info_bits.append(f"CSV domain: {submission['raw_domain']}")
-            if submission.get("submission_url"):
-                basic_info_bits.append("Loaded from server CSV")
-            if basic_info_bits:
-                st.caption(" · ".join(basic_info_bits))
-
             previous_eval = submission.get("previous_eval")
             if previous_eval:
                 previous_total = format_score(previous_eval.get("total_score"))
@@ -2363,32 +2742,9 @@ with st.form("review_inputs_form", clear_on_submit=False):
                     f"Slides {required_present}/5 · Missing {required_missing} · Tokens {token_count}/{MAX_PPT_TOKENS}"
                 )
 
-            grid_col_1, grid_col_2, grid_col_3 = st.columns([1.15, 1.85, 1.25])
+            grid_col_1, grid_col_2 = st.columns([1.85, 1.25])
 
             with grid_col_1:
-                current_domain = submission["domain"] if submission["domain"] in ALL_DOMAINS else ALL_DOMAINS[0]
-                selected_domain = st.selectbox(
-                    "Domain",
-                    options=ALL_DOMAINS,
-                    index=ALL_DOMAINS.index(current_domain),
-                    key=f"domain_{sid}",
-                )
-                submission["domain"] = selected_domain
-
-                ps_options = list(PROBLEM_STATEMENTS[selected_domain].keys())
-                if submission["ps_key"] not in ps_options:
-                    submission["ps_key"] = ps_options[0]
-
-                submission["ps_key"] = st.selectbox(
-                    "Problem statement",
-                    options=ps_options,
-                    index=ps_options.index(submission["ps_key"]),
-                    key=f"ps_{sid}",
-                )
-
-                st.caption(PROBLEM_STATEMENTS[selected_domain][submission["ps_key"]])
-
-            with grid_col_2:
                 submission["media_link"] = st.text_input(
                     "Media link (optional)",
                     value=submission.get("media_link", ""),
@@ -2408,7 +2764,7 @@ with st.form("review_inputs_form", clear_on_submit=False):
                     placeholder="Repository URL",
                 )
 
-            with grid_col_3:
+            with grid_col_2:
                 submission["media_rating"] = st.selectbox(
                     "Media rating",
                     options=[0, 1, 5],
