@@ -26,6 +26,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from base64 import b64encode
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
@@ -1910,6 +1911,38 @@ def format_score(value: Any) -> str:
     return f"{value:.2f}" if isinstance(value, (int, float)) else "—"
 
 
+def build_browser_open_url(submission: dict[str, Any]) -> str | None:
+    submission_url = str(submission.get("submission_url", "") or "").strip()
+    if submission_url:
+        return submission_url
+
+    file_name = str(submission.get("file_name", "") or "")
+    file_ext = Path(file_name).suffix.lower()
+    file_bytes = submission.get("file_bytes")
+    if file_ext != ".pdf" or not isinstance(file_bytes, bytes) or not file_bytes:
+        return None
+
+    encoded_pdf = b64encode(file_bytes).decode("ascii")
+    return f"data:application/pdf;base64,{encoded_pdf}"
+
+
+def render_open_in_browser_link(submission: dict[str, Any], sid: str) -> None:
+    open_url = build_browser_open_url(submission)
+    if not open_url:
+        st.caption("Browser preview is available for source links and uploaded PDFs.")
+        return
+
+    st.markdown(
+        (
+            f'<a href="{open_url}" target="_blank" rel="noopener noreferrer" '
+            f'style="display:inline-block;padding:0.45rem 0.8rem;border-radius:0.5rem;'
+            f'background:#262730;color:white;text-decoration:none;font-weight:600;" '
+            f'id="open-browser-{sid}">Open in browser ↗</a>'
+        ),
+        unsafe_allow_html=True,
+    )
+
+
 def highlight_eval_failed(row: pd.Series) -> list[str]:
     if row.get("VERDICT") == "EVAL_FAILED":
         return ["background-color: #e8f0fe; color: #4a5568"] * len(row)
@@ -2199,6 +2232,8 @@ for entry in uploaded_entries:
             basic_info_bits.append("Loaded from server CSV")
         if basic_info_bits:
             st.caption(" · ".join(basic_info_bits))
+
+        render_open_in_browser_link(submission, sid)
 
         previous_eval = submission.get("previous_eval")
         if previous_eval:
