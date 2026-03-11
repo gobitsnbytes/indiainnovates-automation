@@ -1206,24 +1206,24 @@ def extract_problem_statement_text(slides: dict[str, str]) -> str:
     Stage 4 — domain keyword density scoring across all slides
     Stage 5 — semantic fallback (longest substantive non-template paragraph)
     """
-    slides = {label: sanitize_unicode(text) for label, text in slides.items()}
+    sanitized_slides = {label: sanitize_unicode(text) for label, text in slides.items()}
 
-    for label, content in slides.items():
+    for label, content in sanitized_slides.items():
         if label.upper() == "PROBLEM STATEMENT":
             cleaned = _strip_template_garbage(content)
             if len(cleaned.strip()) > 60:
                 return cleaned.strip()
 
-    all_labels = [label.lower() for label in slides.keys()]
+    all_labels = [label.lower() for label in sanitized_slides.keys()]
     for alias in _PS_SLIDE_ALIASES:
         matches = difflib.get_close_matches(alias, all_labels, n=1, cutoff=0.72)
         if matches:
-            matched_label = list(slides.keys())[all_labels.index(matches[0])]
-            cleaned = _strip_template_garbage(slides[matched_label])
+            matched_label = list(sanitized_slides.keys())[all_labels.index(matches[0])]
+            cleaned = _strip_template_garbage(sanitized_slides[matched_label])
             if len(cleaned.strip()) > 60:
                 return cleaned.strip()
 
-    for label, content in slides.items():
+    for label, content in sanitized_slides.items():
         if label.upper() in {"COVER / TEAM INFO", "THANK YOU"}:
             continue
         match = _PS_INLINE_LABELS.search(content)
@@ -1236,7 +1236,7 @@ def extract_problem_statement_text(slides: dict[str, str]) -> str:
 
     best_score = 0.0
     best_content = ""
-    for label, content in slides.items():
+    for label, content in sanitized_slides.items():
         if label.upper() in {"COVER / TEAM INFO", "THANK YOU", "REFERENCES / LINKS"}:
             continue
         if _TEMPLATE_GARBAGE.search(content):
@@ -1259,7 +1259,7 @@ def extract_problem_statement_text(slides: dict[str, str]) -> str:
         re.IGNORECASE,
     )
     candidates: list[str] = []
-    for label, content in slides.items():
+    for label, content in sanitized_slides.items():
         if label.upper() in {"COVER / TEAM INFO", "THANK YOU"}:
             continue
         for paragraph in re.split(r"\n{2,}", content):
