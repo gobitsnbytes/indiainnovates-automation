@@ -5,6 +5,7 @@ set -Eeuo pipefail
 
 DOMAIN="${1:-}"
 EMAIL="${2:-}"
+INSTANCE_COUNT="${INSTANCE_COUNT:-2}"
 
 if [[ -z "$DOMAIN" ]]; then
   echo "Usage: $0 <your-domain.com> <your-email@example.com>"
@@ -28,10 +29,10 @@ sudo apt install -y nginx certbot python3-certbot-nginx
 echo "==> Installing systemd service"
 sudo cp indiainnovates-automation.service /etc/systemd/system/indiainnovates-automation@.service
 
-# Enable and start all 4 instances
-echo "==> Starting 4 Streamlit instances"
+# Enable and start instances sized for the server
+echo "==> Starting $INSTANCE_COUNT Streamlit instances"
 sudo systemctl daemon-reload
-for i in {1..4}; do
+for i in $(seq 1 "$INSTANCE_COUNT"); do
   sudo systemctl enable indiainnovates-automation@$i
   sudo systemctl start indiainnovates-automation@$i
 done
@@ -41,7 +42,9 @@ sleep 3
 
 # Check service status
 echo "==> Checking service status"
-sudo systemctl status indiainnovates-automation@{1,2,3,4} --no-pager || true
+for i in $(seq 1 "$INSTANCE_COUNT"); do
+  sudo systemctl status "indiainnovates-automation@$i" --no-pager || true
+done
 
 # Update Nginx configuration with actual domain
 echo "==> Configuring Nginx"
@@ -61,7 +64,7 @@ sudo systemctl restart nginx
 
 # Set up SSL with Let's Encrypt
 echo "==> Setting up SSL certificate"
-sudo certbot --nginx -d "$DOMAIN" -d "www.$DOMAIN" --email "$EMAIL" --agree-tos --no-eff-email --redirect || {
+sudo certbot --nginx -d "$DOMAIN" --email "$EMAIL" --agree-tos --no-eff-email --redirect || {
   echo "Warning: SSL setup failed. Please run manually:"
   echo "  sudo certbot --nginx -d $DOMAIN --email $EMAIL --agree-tos --no-eff-email"
 }
@@ -76,12 +79,11 @@ echo ""
 echo "Your app should now be available at:"
 echo "  https://$DOMAIN"
 echo ""
-echo "Make sure your DNS A records point to this server's IP address:"
-echo "  @ (root) -> $(curl -s ifconfig.me)"
-echo "  www -> $(curl -s ifconfig.me)"
+echo "Make sure the DNS A record for the subdomain points to this server's IP address:"
+echo "  evaluation -> $(curl -s ifconfig.me)"
 echo ""
 echo "Useful commands:"
-echo "  sudo systemctl status indiainnovates-automation@{1,2,3,4}  # Check status"
+echo "  sudo systemctl status indiainnovates-automation@1 indiainnovates-automation@2  # Check status"
 echo "  sudo journalctl -u 'indiainnovates-automation@*' -f       # View logs"
-echo "  sudo systemctl restart indiainnovates-automation@{1,2,3,4} # Restart all"
+echo "  sudo systemctl restart indiainnovates-automation@1 indiainnovates-automation@2 # Restart all"
 echo "  htop                                                       # Monitor CPU usage"

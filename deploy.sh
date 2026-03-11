@@ -4,6 +4,7 @@ set -Eeuo pipefail
 DEPLOY_PATH="${DEPLOY_PATH:-/opt/indiainnovates-automation}"
 DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 SYSTEMD_SERVICE="${SYSTEMD_SERVICE:-indiainnovates-automation}"
+INSTANCE_COUNT="${INSTANCE_COUNT:-2}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 VENV_DIR="${VENV_DIR:-.venv}"
 REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-requirements.txt}"
@@ -40,8 +41,8 @@ if [[ -f "$REQUIREMENTS_FILE" ]]; then
 fi
 
 echo "==> Restarting service instances"
-# Restart all 4 instances for multi-core utilization
-for i in {1..4}; do
+# Restart instances sized for the server
+for i in $(seq 1 "$INSTANCE_COUNT"); do
   sudo systemctl restart "${SYSTEMD_SERVICE}@${i}"
 done
 
