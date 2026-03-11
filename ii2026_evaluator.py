@@ -1449,33 +1449,45 @@ for key, default in (("submissions", {}), ("results", []), ("url_downloads", {})
         st.session_state[key] = default
 st.session_state.setdefault("failed_uploads", {})
 
-default_openai_api_key = st.session_state.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
-default_anthropic_api_key = st.session_state.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
-
 with st.sidebar:
     st.markdown("## India Innovates 2026")
     st.markdown("Batch screening evaluator")
     st.divider()
 
-    openai_api_key = st.text_input(
+    openai_api_key_input = st.text_input(
         "OpenAI API Key",
         type="password",
         placeholder="sk-...",
-        value=default_openai_api_key,
+        value="",
     )
-    anthropic_api_key = st.text_input(
+    anthropic_api_key_input = st.text_input(
         "Anthropic API Key",
         type="password",
         placeholder="sk-ant-...",
-        value=default_anthropic_api_key,
+        value="",
     )
-    st.session_state["openai_api_key"] = openai_api_key
-    st.session_state["anthropic_api_key"] = anthropic_api_key
+
+    openai_api_key = openai_api_key_input or st.session_state.get("openai_api_key", "") or os.environ.get("OPENAI_API_KEY", "")
+    anthropic_api_key = (
+        anthropic_api_key_input
+        or st.session_state.get("anthropic_api_key", "")
+        or os.environ.get("ANTHROPIC_API_KEY", "")
+    )
+
+    if openai_api_key_input:
+        st.session_state["openai_api_key"] = openai_api_key_input
+    elif "openai_api_key" not in st.session_state:
+        st.session_state["openai_api_key"] = ""
+
+    if anthropic_api_key_input:
+        st.session_state["anthropic_api_key"] = anthropic_api_key_input
+    elif "anthropic_api_key" not in st.session_state:
+        st.session_state["anthropic_api_key"] = ""
 
     if os.environ.get("OPENAI_API_KEY"):
-        st.caption("OpenAI key loaded from environment.")
+        st.caption("OpenAI key loaded from environment. Not shown in UI.")
     if os.environ.get("ANTHROPIC_API_KEY"):
-        st.caption("Anthropic key loaded from environment.")
+        st.caption("Anthropic key loaded from environment. Not shown in UI.")
 
     model_choice = st.selectbox(
         "Evaluation Model",
