@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-DEPLOY_PATH="${DEPLOY_PATH:-/opt/indiainnovates-automation}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+DEPLOY_PATH="${DEPLOY_PATH:-$SCRIPT_DIR}"
 DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 SYSTEMD_SERVICE="${SYSTEMD_SERVICE:-indiainnovates-automation}"
 INSTANCE_COUNT="${INSTANCE_COUNT:-1}"

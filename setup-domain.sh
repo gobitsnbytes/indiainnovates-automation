@@ -3,6 +3,8 @@
 
 set -Eeuo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
 DOMAIN="${1:-}"
 EMAIL="${2:-}"
 INSTANCE_COUNT="${INSTANCE_COUNT:-2}"
@@ -27,7 +29,8 @@ sudo apt install -y nginx certbot python3-certbot-nginx
 
 # Copy and configure systemd service
 echo "==> Installing systemd service"
-sudo cp indiainnovates-automation.service /etc/systemd/system/indiainnovates-automation@.service
+sed "s|__APP_DIR__|$SCRIPT_DIR|g" indiainnovates-automation.service > /tmp/indiainnovates-automation@.service
+sudo cp /tmp/indiainnovates-automation@.service /etc/systemd/system/indiainnovates-automation@.service
 
 # Enable and start instances sized for the server
 echo "==> Starting $INSTANCE_COUNT Streamlit instances"

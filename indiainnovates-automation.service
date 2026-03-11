@@ -5,14 +5,13 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/indiainnovates-automation
-Environment="PATH=/opt/indiainnovates-automation/.venv/bin"
-ExecStart=/opt/indiainnovates-automation/.venv/bin/streamlit run ii2026_evaluator.py \
+WorkingDirectory=__APP_DIR__
+ExecStart=/usr/bin/env bash -lc 'cd "__APP_DIR__" && if [[ -d .venv ]]; then source .venv/bin/activate; elif [[ -d venv ]]; then source venv/bin/activate; else echo "Virtual environment not found in __APP_DIR__/.venv or __APP_DIR__/venv" >&2; exit 1; fi; exec streamlit run ii2026_evaluator.py \
     --server.port=850%i \
     --server.address=127.0.0.1 \
     --server.headless=true \
     --server.enableCORS=false \
-    --server.enableXsrfProtection=true
+    --server.enableXsrfProtection=true'
 Restart=always
 RestartSec=3
 

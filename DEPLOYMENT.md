@@ -23,20 +23,26 @@ sudo apt install -y nginx certbot python3-certbot-nginx
 ## Step 2: Set Up Application
 
 ```bash
-# Clone/pull latest code
-cd /opt/indiainnovates-automation
+# Clone into the directory you actually want to run from
+git clone <your-repo-url> /root/indiainnovates-automation
+cd /root/indiainnovates-automation
 git pull
+REPO_DIR="$(pwd -P)"
 
 # Activate virtual environment and install dependencies
-source .venv/bin/activate
+source .venv/bin/activate  # or: source venv/bin/activate
 pip install -r requirements.txt
 ```
+
+If your repo is not in `/root/indiainnovates-automation`, use that real path everywhere below.
+The included scripts now auto-detect the current repo directory instead of assuming `/opt/...`.
 
 ## Step 3: Install Systemd Service
 
 ```bash
-# Copy service file
-sudo cp indiainnovates-automation.service /etc/systemd/system/indiainnovates-automation@.service
+# Patch the unit with the real repo path, then install it
+sed "s|__APP_DIR__|$REPO_DIR|g" indiainnovates-automation.service | \
+    sudo tee /etc/systemd/system/indiainnovates-automation@.service > /dev/null
 
 # Enable and start the app instance
 sudo systemctl daemon-reload
@@ -46,7 +52,12 @@ sudo systemctl start indiainnovates-automation@1
 
 # Check status
 sudo systemctl status indiainnovates-automation@1
+
+# Verify installed service paths
+sudo systemctl cat indiainnovates-automation@1
 ```
+
+Note: `setup-domain.sh` patches the service with the current repo path automatically.
 
 ## Step 4: Configure Nginx
 
@@ -154,8 +165,9 @@ sudo journalctl -u indiainnovates-automation@1 -n 50
 sudo netstat -tlnp | grep 850
 
 # Test manually
-source /opt/indiainnovates-automation/.venv/bin/activate
-streamlit run /opt/indiainnovates-automation/ii2026_evaluator.py --server.port=8501
+cd "$REPO_DIR"
+source "$REPO_DIR"/.venv/bin/activate
+streamlit run "$REPO_DIR"/ii2026_evaluator.py --server.port=8501
 ```
 
 ### If Nginx returns 502 Bad Gateway:

@@ -321,6 +321,205 @@ PROBLEM_STATEMENTS: dict[str, dict[str, str]] = {
 
 ALL_DOMAINS = list(PROBLEM_STATEMENTS.keys())
 
+MATCH_STOPWORDS = {
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "into",
+    "that",
+    "this",
+    "your",
+    "their",
+    "our",
+    "about",
+    "over",
+    "under",
+    "through",
+    "using",
+    "based",
+    "local",
+    "hyper",
+    "driven",
+    "powered",
+    "smart",
+    "secure",
+    "dynamic",
+    "system",
+    "engine",
+    "platform",
+    "dashboard",
+    "solution",
+    "solutions",
+    "intelligence",
+    "management",
+    "public",
+    "service",
+    "real",
+    "time",
+    "global",
+    "open",
+    "innovation",
+    "other",
+    "india",
+    "innovates",
+    "team",
+    "final",
+    "deck",
+    "pitch",
+    "submission",
+    "pdf",
+    "ppt",
+    "pptx",
+}
+
+DOMAIN_HINT_ALIASES = {
+    "Domain 1 — Urban Solutions": [
+        "urban solutions",
+        "urban solution",
+        "flood",
+        "hydrology",
+        "aqi",
+        "air quality",
+        "waste",
+        "traffic",
+        "ambulance",
+        "green corridor",
+    ],
+    "Domain 2 — Digital Democracy": [
+        "digital democracy",
+        "democracy",
+        "e voting",
+        "evoting",
+        "blockchain",
+        "booth",
+        "geo fencing",
+        "avatar",
+        "calling agent",
+        "crm",
+        "grievance",
+        "co pilot",
+        "sentiment",
+        "worker management",
+        "ontology",
+    ],
+    "Domain 3 — Open Innovation": [
+        "open innovation",
+        "healthcare",
+        "robotics",
+        "agriculture",
+        "fintech",
+        "deep tech",
+        "cybersecurity",
+        "ai ml",
+        "sustainability",
+        "edtech",
+        "smart governance",
+    ],
+}
+
+
+def _normalize_match_text(text: str) -> str:
+    normalized = text.lower()
+    normalized = normalized.replace("&", " and ")
+    normalized = normalized.replace("/", " ")
+    normalized = normalized.replace("_", " ")
+    normalized = normalized.replace("-", " ")
+    normalized = re.sub(r"[^a-z0-9\s]", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def _match_tokens(text: str) -> set[str]:
+    return {
+        token
+        for token in _normalize_match_text(text).split()
+        if len(token) >= 3 and not token.isdigit() and token not in MATCH_STOPWORDS
+    }
+
+
+def _strip_ps_code(ps_key: str) -> str:
+    return re.sub(r"^\s*[0-9]+[A-Z]\s*[·.:-]\s*", "", ps_key).strip()
+
+
+def infer_domain_and_ps(
+    file_name: str,
+    team_name: str,
+    extracted_ps: str,
+    slides: dict[str, str],
+) -> tuple[str | None, str | None]:
+    hint_parts = [
+        Path(file_name).stem,
+        team_name,
+        extracted_ps,
+        slides.get("COVER / TEAM INFO", ""),
+    ]
+    hint_text = "\n".join(part for part in hint_parts if part)
+    normalized_hint = _normalize_match_text(hint_text)
+    padded_hint = f" {normalized_hint} "
+    hint_tokens = _match_tokens(hint_text)
+
+    ps_code_lookup = {
+        _normalize_match_text(ps_key.split("·", 1)[0]): (domain, ps_key)
+        for domain, statements in PROBLEM_STATEMENTS.items()
+        for ps_key in statements
+    }
+    explicit_code_match = re.search(r"\b([123][a-z])\b", normalized_hint)
+    if explicit_code_match:
+        explicit = ps_code_lookup.get(explicit_code_match.group(1))
+        if explicit is not None:
+            return explicit
+
+    domain_scores = {domain: 0 for domain in PROBLEM_STATEMENTS}
+    for domain, aliases in DOMAIN_HINT_ALIASES.items():
+        for alias in aliases:
+            alias_normalized = _normalize_match_text(alias)
+            if f" {alias_normalized} " in padded_hint:
+                domain_scores[domain] += 8 if " " in alias_normalized else 5
+            else:
+                domain_scores[domain] += len(hint_tokens & _match_tokens(alias))
+
+    best_domain: str | None = None
+    best_domain_score = -1
+    for domain, score in domain_scores.items():
+        if score > best_domain_score:
+            best_domain = domain
+            best_domain_score = score
+
+    if best_domain is None:
+        return None, None
+
+    inferred_domain = best_domain if domain_scores[best_domain] >= 3 else None
+
+    best_ps: tuple[int, str | None, str | None] = (0, None, None)
+    candidate_domains = [inferred_domain] if inferred_domain else list(PROBLEM_STATEMENTS.keys())
+    for domain in candidate_domains:
+        if domain is None:
+            continue
+        for ps_key, ps_text in PROBLEM_STATEMENTS[domain].items():
+            title = _strip_ps_code(ps_key)
+            title_tokens = _match_tokens(title)
+            description_tokens = _match_tokens(ps_text)
+            score = 0
+
+            normalized_title = _normalize_match_text(title)
+            if normalized_title and f" {normalized_title} " in padded_hint:
+                score += 12
+
+            score += 4 * len(hint_tokens & title_tokens)
+            score += len(hint_tokens & description_tokens)
+
+            if score > best_ps[0]:
+                best_ps = (score, domain, ps_key)
+
+    if best_ps[0] >= 4 and best_ps[1] and best_ps[2]:
+        return best_ps[1], best_ps[2]
+
+    if inferred_domain:
+        return inferred_domain, list(PROBLEM_STATEMENTS[inferred_domain].keys())[0]
+
+    return None, None
+
 SYSTEM_PROMPT = """
 You are a brutally strict technical reviewer for India Innovates 2026.
 
@@ -1176,13 +1375,13 @@ ALIGNMENT RUBRIC
 10 = addresses every required element clearly and concretely
 
 Return strict JSON with this exact shape:
-{
-  "ppt_score_raw": 0,
-  "alignment_score_raw": 0,
-  "ppt_verdict": "short sentence",
-  "alignment_verdict": "short sentence",
-  "red_flags": ["flag 1", "flag 2"]
-}
+{{
+    "ppt_score_raw": 0,
+    "alignment_score_raw": 0,
+    "ppt_verdict": "short sentence",
+    "alignment_verdict": "short sentence",
+    "red_flags": ["flag 1", "flag 2"]
+}}
 
 No markdown. No commentary. JSON only.
 """.strip()
@@ -1328,6 +1527,9 @@ def ensure_submission_defaults(
     team_name = try_extract_team_name(slide_map)
     default_domain = ALL_DOMAINS[0]
     default_ps_key = list(PROBLEM_STATEMENTS[default_domain].keys())[0]
+    inferred_domain, inferred_ps_key = infer_domain_and_ps(file_name, team_name, extracted_ps, slide_map)
+    initial_domain = inferred_domain or default_domain
+    initial_ps_key = inferred_ps_key or list(PROBLEM_STATEMENTS[initial_domain].keys())[0]
 
     base = {
         "sid": sid,
@@ -1336,8 +1538,8 @@ def ensure_submission_defaults(
         "file_bytes": file_bytes,
         "submission_url": submission_url,
         "team_name": team_name,
-        "domain": default_domain,
-        "ps_key": default_ps_key,
+        "domain": initial_domain,
+        "ps_key": initial_ps_key,
         "media_link": "",
         "prototype_link": "",
         "github_link": "",
@@ -1375,6 +1577,22 @@ def ensure_submission_defaults(
     merged["previous_eval"] = previous_eval
     if not merged.get("team_name") or merged["team_name"] == "Unknown Team":
         merged["team_name"] = team_name
+    if (
+        not merged.get("domain")
+        or merged["domain"] not in PROBLEM_STATEMENTS
+        or (merged.get("domain") == default_domain and merged.get("ps_key") == default_ps_key and inferred_domain)
+    ):
+        merged["domain"] = inferred_domain or default_domain
+    valid_ps_options = PROBLEM_STATEMENTS.get(merged["domain"], {})
+    if not valid_ps_options:
+        merged["domain"] = default_domain
+        valid_ps_options = PROBLEM_STATEMENTS[default_domain]
+    if (
+        not merged.get("ps_key")
+        or merged["ps_key"] not in valid_ps_options
+        or (merged.get("domain") == (inferred_domain or merged.get("domain")) and merged.get("ps_key") == default_ps_key and inferred_ps_key)
+    ):
+        merged["ps_key"] = inferred_ps_key or next(iter(valid_ps_options))
     merged["ppt_payload"], merged["present_required"], merged["missing_required"] = build_llm_ppt_payload(slide_map)
     if previous_eval is not None and not merged.get("llm_result"):
         merged["last_result_row"] = build_existing_result_row(sid, merged, previous_eval)
