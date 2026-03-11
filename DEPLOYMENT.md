@@ -1,7 +1,12 @@
-# Multi-Core Deployment with Domain Setup
+# Stable Deployment with Domain Setup
 
 ## Overview
-This configuration runs 4 Streamlit instances (one per vCPU) with Nginx load balancing.
+This configuration runs a single Streamlit instance behind Nginx.
+
+> Important: `st.file_uploader` uses process-local Streamlit session state. Running multiple
+> Streamlit replicas behind Nginx can cause intermittent `400 Invalid session_id` upload failures.
+> Use one backend instance unless you introduce a deployment architecture that guarantees a
+> single Streamlit process per browser session end-to-end.
 
 ## Prerequisites
 - VPS with 4 vCPUs
@@ -27,26 +32,20 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Step 3: Install Systemd Services (4 instances)
+## Step 3: Install Systemd Service
 
 ```bash
 # Copy service file
 sudo cp indiainnovates-automation.service /etc/systemd/system/indiainnovates-automation@.service
 
-# Enable and start all 4 instances
+# Enable and start the app instance
 sudo systemctl daemon-reload
 sudo systemctl enable indiainnovates-automation@1
-sudo systemctl enable indiainnovates-automation@2
-sudo systemctl enable indiainnovates-automation@3
-sudo systemctl enable indiainnovates-automation@4
 
 sudo systemctl start indiainnovates-automation@1
-sudo systemctl start indiainnovates-automation@2
-sudo systemctl start indiainnovates-automation@3
-sudo systemctl start indiainnovates-automation@4
 
 # Check status
-sudo systemctl status indiainnovates-automation@{1,2,3,4}
+sudo systemctl status indiainnovates-automation@1
 ```
 
 ## Step 4: Configure Nginx
@@ -105,19 +104,11 @@ Point your subdomain to your VPS:
 
 ### View logs
 ```bash
-# All instances
-sudo journalctl -u 'indiainnovates-automation@*' -f
-
-# Specific instance
 sudo journalctl -u indiainnovates-automation@1 -f
 ```
 
 ### Restart services
 ```bash
-# All instances
-sudo systemctl restart indiainnovates-automation@{1,2,3,4}
-
-# Single instance
 sudo systemctl restart indiainnovates-automation@1
 ```
 
@@ -169,8 +160,8 @@ streamlit run /opt/indiainnovates-automation/ii2026_evaluator.py --server.port=8
 
 ### If Nginx returns 502 Bad Gateway:
 ```bash
-# Check if Streamlit instances are running
-sudo systemctl status indiainnovates-automation@{1,2,3,4}
+# Check if Streamlit is running
+sudo systemctl status indiainnovates-automation@1
 
 # Check Nginx error log
 sudo tail -f /var/log/nginx/error.log
@@ -188,22 +179,11 @@ sudo systemctl status nginx
 sudo certbot --nginx -d evaluation.gobitsnbytes.org
 ```
 
-## Updated deploy.sh
-
-The existing `deploy.sh` script should be updated to restart all 4 instances:
-
-```bash
-# Add to the end of deploy.sh
-sudo systemctl restart indiainnovates-automation@{1,2,3,4}
-```
-
 ## Performance Notes
 
-- **Load Balancing**: Nginx uses `least_conn` algorithm to distribute requests to the least busy instance
-- **Session Affinity**: Streamlit handles its own session state via WebSockets, so no sticky sessions needed
-- **Failure Handling**: If an instance fails, Nginx automatically routes to healthy instances
-- **CPU Utilization**: Each Streamlit instance runs on a separate process, allowing full 4-core utilization
-- **Scalability**: Can handle ~4x more concurrent users compared to single instance
+- **Upload stability**: Single-backend routing avoids `Invalid session_id` failures during uploads.
+- **Session correctness**: Streamlit session state stays inside one Python process.
+- **Scale path**: If you need more throughput, prefer a larger single instance or redesign uploads/storage around a different frontend/backend split.
 
 ## Monitoring
 
