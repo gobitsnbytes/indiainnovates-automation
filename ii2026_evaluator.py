@@ -770,6 +770,52 @@ def get_latest_evaluation(submission_hash: str) -> dict[str, Any] | None:
             connection.close()
 
 
+def get_latest_evaluations_bulk(submission_hashes: list[str]) -> dict[str, dict[str, Any]]:
+    cleaned_hashes = [submission_hash for submission_hash in submission_hashes if submission_hash]
+    if not cleaned_hashes:
+        return {}
+
+    connection: "psycopg.Connection[DictRow] | None" = None
+    try:
+        connection = get_db_connection()
+        rows = connection.execute(
+            """
+            SELECT DISTINCT ON (submission_hash)
+                evaluated_at,
+                attempt_no,
+                submission_hash,
+                team_name,
+                file_name,
+                domain,
+                problem_stmt,
+                media_score,
+                proto_score,
+                ppt_score,
+                align_score,
+                visual_score,
+                total_score,
+                verdict,
+                eval_status,
+                ppt_verdict,
+                align_verdict,
+                red_flags,
+                model,
+                submission_url
+            FROM audit_log
+            WHERE submission_hash = ANY(%s)
+            ORDER BY submission_hash, attempt_no DESC, id DESC
+            """,
+            (cleaned_hashes,),
+        ).fetchall()
+        return {str(row["submission_hash"]): dict(row) for row in rows if row.get("submission_hash")}
+    except (psycopg.Error, ValueError) as exc:
+        st.error(f"Failed to read previous evaluations: {exc}")
+        return {}
+    finally:
+        if connection is not None:
+            connection.close()
+
+
 def get_evaluated_submission_urls() -> set[str]:
     connection: "psycopg.Connection[DictRow] | None" = None
     try:
@@ -1737,12 +1783,13 @@ def ensure_submission_defaults(
     submission_hash_value: str,
     submission_url: str = "",
     prefill: dict[str, Any] | None = None,
+    previous_eval: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     prefill = prefill or {}
     extracted_map = extract_submission(file_bytes, file_name)
     slide_entries, slide_map = build_slide_entries(extracted_map)
     extracted_ps = extract_problem_statement_text(slide_map)
-    previous_eval = get_latest_evaluation(submission_hash_value)
+    previous_eval = previous_eval if previous_eval is not None else get_latest_evaluation(submission_hash_value)
     team_name = try_extract_team_name(slide_map)
     default_domain = ALL_DOMAINS[0]
     default_ps_key = list(PROBLEM_STATEMENTS[default_domain].keys())[0]
@@ -1752,6 +1799,7 @@ def ensure_submission_defaults(
     prefill_domain = prefill.get("domain") if prefill.get("domain") in PROBLEM_STATEMENTS else None
     prefill_ps_options = PROBLEM_STATEMENTS.get(prefill_domain, {}) if prefill_domain else {}
     prefill_ps_key = prefill.get("ps_key") if prefill.get("ps_key") in prefill_ps_options else None
+    prefill_signature = json.dumps(prefill, sort_keys=True, ensure_ascii=False, default=str)
 
     base = {
         "sid": sid,
@@ -1771,6 +1819,7 @@ def ensure_submission_defaults(
         "regn_id": str(prefill.get("regn_id", "") or ""),
         "submission_timestamp": str(prefill.get("submission_timestamp", "") or ""),
         "raw_domain": str(prefill.get("raw_domain", "") or ""),
+        "prefill_signature": prefill_signature,
         "slide_map": slide_map,
         "slides": slide_entries,
         "extracted_ps": extracted_ps,
@@ -1800,6 +1849,7 @@ def ensure_submission_defaults(
     merged["slides"] = slide_entries
     merged["extracted_ps"] = extracted_ps
     merged["previous_eval"] = previous_eval
+    merged["prefill_signature"] = prefill_signature
     merged["submission_url"] = submission_url or merged.get("submission_url", "")
     if prefill.get("regn_id"):
         merged["regn_id"] = str(prefill.get("regn_id", ""))
@@ -1927,6 +1977,25 @@ def build_browser_open_url(submission: dict[str, Any]) -> str | None:
 
 
 def render_open_in_browser_link(submission: dict[str, Any], sid: str) -> None:
+    submission_url = str(submission.get("submission_url", "") or "").strip()
+    if submission_url:
+        st.link_button("Open in browser ↗", submission_url, use_container_width=False)
+        return
+
+    file_name = str(submission.get("file_name", "") or "")
+    file_ext = Path(file_name).suffix.lower()
+    if file_ext != ".pdf":
+        st.caption("Browser preview is available for source links and uploaded PDFs.")
+        return
+
+    preview_state_key = f"browser_preview_ready_{sid}"
+    if not st.session_state.get(preview_state_key, False):
+        if st.button("Prepare browser tab ↗", key=f"prepare_browser_{sid}"):
+            st.session_state[preview_state_key] = True
+            st.rerun()
+        st.caption("PDF browser preview is prepared only when needed to keep the page fast.")
+        return
+
     open_url = build_browser_open_url(submission)
     if not open_url:
         st.caption("Browser preview is available for source links and uploaded PDFs.")
@@ -2176,27 +2245,46 @@ for stale_sid in list(st.session_state.failed_uploads.keys()):
     if stale_sid not in current_sids:
         del st.session_state.failed_uploads[stale_sid]
 
+submission_hashes = [str(entry.get("submission_hash", "") or "") for entry in uploaded_entries]
+latest_eval_by_hash = get_latest_evaluations_bulk(submission_hashes)
+
 for entry in uploaded_entries:
     sid = entry["sid"]
     raw_bytes = entry["file_bytes"]
     file_name = entry["file_name"]
     existing = st.session_state.submissions.get(sid)
+    current_prefill = entry.get("prefill") or {}
+    current_prefill_signature = json.dumps(current_prefill, sort_keys=True, ensure_ascii=False, default=str)
+    previous_eval = latest_eval_by_hash.get(entry["submission_hash"])
     try:
         if len(raw_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
             raise ValueError(
                 f"File exceeds {MAX_UPLOAD_MB}MB limit. Compress the PDF using "
                 f"{PDF_COMPRESS_HELP_URL} and upload it again."
             )
-        with st.spinner(f"Extracting text from {file_name}..."):
-            st.session_state.submissions[sid] = ensure_submission_defaults(
-                existing,
-                raw_bytes,
-                sid,
-                file_name,
-                entry["submission_hash"],
-                submission_url=entry.get("submission_url", ""),
-                prefill=entry.get("prefill"),
-            )
+        needs_refresh = (
+            existing is None
+            or existing.get("submission_hash") != entry["submission_hash"]
+            or existing.get("file_name") != file_name
+            or existing.get("prefill_signature", "") != current_prefill_signature
+        )
+        if needs_refresh:
+            with st.spinner(f"Extracting text from {file_name}..."):
+                st.session_state.submissions[sid] = ensure_submission_defaults(
+                    existing,
+                    raw_bytes,
+                    sid,
+                    file_name,
+                    entry["submission_hash"],
+                    submission_url=entry.get("submission_url", ""),
+                    prefill=current_prefill,
+                    previous_eval=previous_eval,
+                )
+        else:
+            existing["previous_eval"] = previous_eval
+            if previous_eval is not None and not existing.get("llm_result"):
+                existing["last_result_row"] = build_existing_result_row(sid, existing, previous_eval)
+            st.session_state.submissions[sid] = existing
         st.session_state.failed_uploads.pop(sid, None)
     except Exception as exc:  # noqa: BLE001
         st.session_state.failed_uploads[sid] = str(exc)
@@ -2204,193 +2292,210 @@ for entry in uploaded_entries:
 
 st.header("Step 2 · Human review inputs", divider="gray")
 st.info(
-    "Match the exact problem statement claimed by the team. Media is optional bonus. Prototype + GitHub rating 0 triggers auto-OUT and skips LLM evaluation."
+    "Compact mode is on: changes are applied only when you click Save review inputs or Evaluate all submissions. This avoids slow reruns on every click."
 )
+
+trigger = False
+saved_inputs = False
+
+with st.form("review_inputs_form", clear_on_submit=False):
+    for entry in uploaded_entries:
+        sid = entry["sid"]
+        file_name = entry["file_name"]
+
+        if sid in st.session_state.failed_uploads:
+            st.error(f"Could not parse {file_name}: {st.session_state.failed_uploads[sid]}")
+            continue
+
+        submission = st.session_state.submissions.get(sid)
+        if submission is None:
+            st.error(f"Could not load {file_name}: missing submission state.")
+            continue
+
+        with st.expander(f"{file_name} · Team: {submission['team_name']}", expanded=False):
+            basic_info_bits = []
+            if submission.get("regn_id"):
+                basic_info_bits.append(f"Regn ID: {submission['regn_id']}")
+            if submission.get("submission_timestamp"):
+                basic_info_bits.append(f"Submitted: {submission['submission_timestamp']}")
+            if submission.get("raw_domain"):
+                basic_info_bits.append(f"CSV domain: {submission['raw_domain']}")
+            if submission.get("submission_url"):
+                basic_info_bits.append("Loaded from server CSV")
+            if basic_info_bits:
+                st.caption(" · ".join(basic_info_bits))
+
+            previous_eval = submission.get("previous_eval")
+            if previous_eval:
+                previous_total = format_score(previous_eval.get("total_score"))
+                previous_verdict = previous_eval.get("verdict", "—")
+                previous_when = previous_eval.get("evaluated_at", "")
+                previous_attempt = previous_eval.get("attempt_no", "—")
+                st.warning(
+                    f"Already evaluated. Previous total: {previous_total} · Verdict: {previous_verdict} · "
+                    f"Attempt: {previous_attempt} · Time: {previous_when}"
+                )
+                st.caption(
+                    f"Previous model: {previous_eval.get('model', '—')} · "
+                    f"PPT {format_score(previous_eval.get('ppt_score'))} · "
+                    f"Alignment {format_score(previous_eval.get('align_score'))}"
+                )
+
+            top_col_1, top_col_2, top_col_3 = st.columns([1.4, 1, 1])
+            with top_col_1:
+                submission["team_name"] = st.text_input(
+                    "Team name",
+                    value=submission["team_name"],
+                    key=f"team_{sid}",
+                )
+            with top_col_2:
+                submission["reeval_requested"] = st.checkbox(
+                    "Re-evaluate",
+                    value=submission.get("reeval_requested", False),
+                    key=f"reeval_{sid}",
+                )
+            with top_col_3:
+                st.caption("Extraction is cached.")
+                token_count = count_tokens(submission.get("ppt_payload", ""), model_choice)
+                required_present = len(submission.get("present_required", []))
+                required_missing = len(submission.get("missing_required", []))
+                st.caption(
+                    f"Slides {required_present}/5 · Missing {required_missing} · Tokens {token_count}/{MAX_PPT_TOKENS}"
+                )
+
+            grid_col_1, grid_col_2, grid_col_3 = st.columns([1.15, 1.85, 1.25])
+
+            with grid_col_1:
+                current_domain = submission["domain"] if submission["domain"] in ALL_DOMAINS else ALL_DOMAINS[0]
+                selected_domain = st.selectbox(
+                    "Domain",
+                    options=ALL_DOMAINS,
+                    index=ALL_DOMAINS.index(current_domain),
+                    key=f"domain_{sid}",
+                )
+                submission["domain"] = selected_domain
+
+                ps_options = list(PROBLEM_STATEMENTS[selected_domain].keys())
+                if submission["ps_key"] not in ps_options:
+                    submission["ps_key"] = ps_options[0]
+
+                submission["ps_key"] = st.selectbox(
+                    "Problem statement",
+                    options=ps_options,
+                    index=ps_options.index(submission["ps_key"]),
+                    key=f"ps_{sid}",
+                )
+
+                st.caption(PROBLEM_STATEMENTS[selected_domain][submission["ps_key"]])
+
+            with grid_col_2:
+                submission["media_link"] = st.text_input(
+                    "Media link (optional)",
+                    value=submission.get("media_link", ""),
+                    key=f"media_link_{sid}",
+                    placeholder="Video / demo / audio link",
+                )
+                submission["prototype_link"] = st.text_input(
+                    "Prototype link",
+                    value=submission.get("prototype_link", ""),
+                    key=f"prototype_link_{sid}",
+                    placeholder="Live prototype or deployment link",
+                )
+                submission["github_link"] = st.text_input(
+                    "GitHub repo link",
+                    value=submission.get("github_link", ""),
+                    key=f"github_link_{sid}",
+                    placeholder="Repository URL",
+                )
+
+            with grid_col_3:
+                submission["media_rating"] = st.selectbox(
+                    "Media rating",
+                    options=[0, 1, 5],
+                    index=[0, 1, 5].index(submission.get("media_rating", 0)),
+                    key=f"media_rating_{sid}",
+                    format_func=lambda value: {0: "0 · Not submitted", 1: "1 · Weak", 5: "5 · Strong"}[value],
+                )
+                submission["proto_rating"] = st.selectbox(
+                    "Prototype + GitHub rating",
+                    options=[0, 1, 5],
+                    index=[0, 1, 5].index(submission.get("proto_rating", 0)),
+                    key=f"proto_rating_{sid}",
+                    format_func=lambda value: {0: "0 · Missing", 1: "1 · Weak", 5: "5 · Strong"}[value],
+                )
+                submission["visual_rating"] = st.selectbox(
+                    "Visual bonus",
+                    options=[0, 1, 2],
+                    index=[0, 1, 2].index(submission.get("visual_rating", 0)),
+                    key=f"visual_{sid}",
+                    format_func=lambda value: {
+                        0: "0 · Nothing extra",
+                        1: "1 · +0.05",
+                        2: "2 · +0.10",
+                    }[value],
+                )
+
+            if previous_eval and not submission.get("reeval_requested", False):
+                st.caption("Default behavior: skip duplicate evaluation and keep the previous result.")
+
+            if submission.get("last_result_row"):
+                last_result = submission["last_result_row"]
+                if last_result["VERDICT"] == "EVAL_FAILED":
+                    st.markdown("**Last score:** evaluation failed → ⚠️ EVAL_FAILED")
+                else:
+                    verdict_label = "✅ IN" if last_result["VERDICT"] == "IN" else f"❌ {last_result['VERDICT']}"
+                    st.markdown(f"**Last score:** total **{format_score(last_result['TOTAL'])}** → {verdict_label}")
+                st.caption(
+                    f"Media {format_score(last_result['Media Score'])} · Prototype {format_score(last_result['Prototype Score'])} · "
+                    f"Visual {format_score(last_result['Visual Score'])} · PPT {format_score(last_result['PPT Score'])} · "
+                    f"Alignment {format_score(last_result['Alignment Score'])}"
+                )
+
+    action_col_1, action_col_2 = st.columns(2)
+    with action_col_1:
+        saved_inputs = st.form_submit_button("Save review inputs", use_container_width=True)
+    with action_col_2:
+        trigger = st.form_submit_button("Evaluate all submissions", type="primary", use_container_width=True)
+
+if saved_inputs and not trigger:
+    st.success("Review inputs saved.")
+
+st.header("Step 3 · Run LLM evaluation", divider="gray")
+st.caption(
+    f"Batch size: {len(st.session_state.submissions)} · Model: {model_choice} · "
+    f"PPT token budget per submission: {MAX_PPT_TOKENS}"
+)
+st.caption("Open details only when needed below to keep the page responsive.")
 
 for entry in uploaded_entries:
     sid = entry["sid"]
     file_name = entry["file_name"]
 
     if sid in st.session_state.failed_uploads:
-        st.error(f"Could not parse {file_name}: {st.session_state.failed_uploads[sid]}")
         continue
 
     submission = st.session_state.submissions.get(sid)
     if submission is None:
-        st.error(f"Could not load {file_name}: missing submission state.")
         continue
 
-    with st.expander(f"{file_name} · Team: {submission['team_name']}", expanded=True):
-        basic_info_bits = []
-        if submission.get("regn_id"):
-            basic_info_bits.append(f"Regn ID: {submission['regn_id']}")
-        if submission.get("submission_timestamp"):
-            basic_info_bits.append(f"Submitted: {submission['submission_timestamp']}")
-        if submission.get("raw_domain"):
-            basic_info_bits.append(f"CSV domain: {submission['raw_domain']}")
-        if submission.get("submission_url"):
-            basic_info_bits.append("Loaded from server CSV")
-        if basic_info_bits:
-            st.caption(" · ".join(basic_info_bits))
-
+    with st.expander(f"Details · {file_name}", expanded=False):
         render_open_in_browser_link(submission, sid)
-
-        previous_eval = submission.get("previous_eval")
-        if previous_eval:
-            previous_total = format_score(previous_eval.get("total_score"))
-            previous_verdict = previous_eval.get("verdict", "—")
-            previous_when = previous_eval.get("evaluated_at", "")
-            previous_attempt = previous_eval.get("attempt_no", "—")
-            st.warning(
-                f"This project has already been evaluated. Previous total: {previous_total} · "
-                f"Verdict: {previous_verdict} · Attempt: {previous_attempt} · Time: {previous_when}"
-            )
-            st.caption(
-                f"Previous model: {previous_eval.get('model', '—')} · "
-                f"PPT {format_score(previous_eval.get('ppt_score'))} · "
-                f"Alignment {format_score(previous_eval.get('align_score'))}"
-            )
-            submission["reeval_requested"] = st.checkbox(
-                "Re-evaluate this submission",
-                value=submission.get("reeval_requested", False),
-                key=f"reeval_{sid}",
-            )
-            if not submission.get("reeval_requested", False):
-                st.caption("Default behavior: skip duplicate evaluation and keep the previous result.")
-
-        submission["team_name"] = st.text_input(
-            "Team name",
-            value=submission["team_name"],
-            key=f"team_{sid}",
-        )
-
-        left_col, right_col = st.columns([1.2, 1])
-
-        with left_col:
-            current_domain = submission["domain"] if submission["domain"] in ALL_DOMAINS else ALL_DOMAINS[0]
-            selected_domain = st.selectbox(
-                "Domain",
-                options=ALL_DOMAINS,
-                index=ALL_DOMAINS.index(current_domain),
-                key=f"domain_{sid}",
-            )
-            submission["domain"] = selected_domain
-
-            ps_options = list(PROBLEM_STATEMENTS[selected_domain].keys())
-            if submission["ps_key"] not in ps_options:
-                submission["ps_key"] = ps_options[0]
-
-            submission["ps_key"] = st.selectbox(
-                "Problem statement",
-                options=ps_options,
-                index=ps_options.index(submission["ps_key"]),
-                key=f"ps_{sid}",
-            )
-
-            with st.expander("Problem statement requirements", expanded=False):
-                st.write(PROBLEM_STATEMENTS[selected_domain][submission["ps_key"]])
-
-        with right_col:
-            submission["media_link"] = st.text_input(
-                "Media link (optional)",
-                value=submission.get("media_link", ""),
-                key=f"media_link_{sid}",
-                placeholder="Video / demo / audio link",
-            )
-            submission["prototype_link"] = st.text_input(
-                "Prototype link",
-                value=submission.get("prototype_link", ""),
-                key=f"prototype_link_{sid}",
-                placeholder="Live prototype or deployment link",
-            )
-            submission["github_link"] = st.text_input(
-                "GitHub repo link",
-                value=submission.get("github_link", ""),
-                key=f"github_link_{sid}",
-                placeholder="Repository URL",
-            )
-
-        rating_col_1, rating_col_2 = st.columns(2)
-        with rating_col_1:
-            submission["media_rating"] = st.radio(
-                "Media rating",
-                options=[0, 1, 5],
-                horizontal=True,
-                key=f"media_rating_{sid}",
-                index=[0, 1, 5].index(submission["media_rating"]),
-                format_func=lambda value: {0: "0 · Not submitted", 1: "1 · Weak", 5: "5 · Strong"}[value],
-            )
-        with rating_col_2:
-            submission["proto_rating"] = st.radio(
-                "Prototype + GitHub rating",
-                options=[0, 1, 5],
-                horizontal=True,
-                key=f"proto_rating_{sid}",
-                index=[0, 1, 5].index(submission["proto_rating"]),
-                format_func=lambda value: {0: "0 · Missing", 1: "1 · Weak", 5: "5 · Strong"}[value],
-            )
-
-        visual_r = st.radio(
-            "🎨 Visual richness bonus — graphs, diagrams, polished design (optional, human-only)",
-            options=[0, 1, 2],
-            horizontal=True,
-            index=[0, 1, 2].index(submission.get("visual_rating", 0)),
-            key=f"visual_{sid}",
-            format_func=lambda value: {
-                0: "0 · Nothing extra",
-                1: "1 · +0.05 · Some graphs / decent design",
-                2: "2 · +0.10 · Exceptional visuals / architecture diagrams",
-            }[value],
-        )
-        submission["visual_rating"] = visual_r
-
-        action_col, status_col = st.columns([1, 2])
-        with action_col:
-            st.caption("Extraction is cached and refreshes automatically when the uploaded file changes.")
-
-        with status_col:
-            token_count = count_tokens(submission.get("ppt_payload", ""), model_choice)
-            required_present = len(submission.get("present_required", []))
-            required_missing = len(submission.get("missing_required", []))
-            st.caption(
-                f"Required slides present: {required_present}/5 · Missing/template: {required_missing} · "
-                f"Prompt payload tokens: {token_count}/{MAX_PPT_TOKENS}"
-            )
-
         with st.expander("Extracted text preview", expanded=False):
-            render_slide_preview(submission, sid)
+            if st.checkbox("Show extracted text", key=f"show_preview_{sid}"):
+                render_slide_preview(submission, sid)
 
         if submission.get("extracted_ps"):
             with st.expander("🎯 Extracted Problem Statement (preview)", expanded=False):
-                st.text_area(
-                    "",
-                    value=submission["extracted_ps"],
-                    height=120,
-                    disabled=True,
-                    key=f"ps_preview_{sid}",
-                )
+                if st.checkbox("Show extracted problem statement", key=f"show_ps_preview_{sid}"):
+                    st.text_area(
+                        "",
+                        value=submission["extracted_ps"],
+                        height=120,
+                        disabled=True,
+                        key=f"ps_preview_{sid}",
+                    )
         else:
             st.caption("⚠️ Problem statement could not be auto-extracted — full slide text will be used.")
-
-        if submission.get("last_result_row"):
-            last_result = submission["last_result_row"]
-            if last_result["VERDICT"] == "EVAL_FAILED":
-                st.markdown("**Last score:** evaluation failed → ⚠️ EVAL_FAILED")
-            else:
-                verdict_label = "✅ IN" if last_result["VERDICT"] == "IN" else f"❌ {last_result['VERDICT']}"
-                st.markdown(f"**Last score:** total **{format_score(last_result['TOTAL'])}** → {verdict_label}")
-            st.caption(
-                f"Media {format_score(last_result['Media Score'])} · Prototype {format_score(last_result['Prototype Score'])} · "
-                f"Visual {format_score(last_result['Visual Score'])} · PPT {format_score(last_result['PPT Score'])} · "
-                f"Alignment {format_score(last_result['Alignment Score'])}"
-            )
-
-st.header("Step 3 · Run LLM evaluation", divider="gray")
-trigger = st.button("Evaluate all submissions", type="primary", use_container_width=True)
-st.caption(
-    f"Batch size: {len(st.session_state.submissions)} · Model: {model_choice} · "
-    f"PPT token budget per submission: {MAX_PPT_TOKENS}"
-)
 
 if trigger:
     if model_choice in OPENAI_MODELS and not openai_api_key:
