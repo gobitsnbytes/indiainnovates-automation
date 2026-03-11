@@ -79,6 +79,7 @@ ENV_PATH = BASE_DIR / ".env"
 DATABASE_URL_ENV_VAR = "DATABASE_URL"
 
 MAX_UPLOAD_MB = 20
+PDF_COMPRESS_HELP_URL = "https://www.ilovepdf.com/compress_pdf"
 MIN_TEXT_CHARS = 80
 RESERVED_OUTPUT_TOKENS = 512
 SAFETY_MARGIN_TOKENS = 500
@@ -1776,6 +1777,10 @@ uploaded_files = st.file_uploader(
     type=["pdf", "pptx", "ppt"],
     accept_multiple_files=True,
 )
+st.info(
+    f"If a PDF is larger than {MAX_UPLOAD_MB}MB, compress it first using "
+    f"[iLovePDF]({PDF_COMPRESS_HELP_URL}), then upload the compressed file."
+)
 
 # ── URL download section ─────────────────────────────────────────────
 st.markdown("**Or add a submission via direct URL**")
@@ -1813,10 +1818,11 @@ if not has_any:
     st.markdown(
         """
 1. Upload PDF / PPTX submissions (or paste a download URL above).
-2. Confirm team, domain, and problem statement.
-3. Add human-reviewed media / prototype / GitHub inputs.
-4. Run evaluation.
-5. Export the results CSV.
+2. If a PDF is larger than 20MB, compress it with [iLovePDF](https://www.ilovepdf.com/compress_pdf) and upload it again.
+3. Confirm team, domain, and problem statement.
+4. Add human-reviewed media / prototype / GitHub inputs.
+5. Run evaluation.
+6. Export the results CSV.
         """
     )
     st.stop()
@@ -1868,7 +1874,10 @@ for entry in uploaded_entries:
     existing = st.session_state.submissions.get(sid)
     try:
         if len(raw_bytes) > MAX_UPLOAD_MB * 1024 * 1024:
-            raise ValueError(f"File exceeds {MAX_UPLOAD_MB}MB limit")
+            raise ValueError(
+                f"File exceeds {MAX_UPLOAD_MB}MB limit. Compress the PDF using "
+                f"{PDF_COMPRESS_HELP_URL} and upload it again."
+            )
         with st.spinner(f"Extracting text from {file_name}..."):
             st.session_state.submissions[sid] = ensure_submission_defaults(
                 existing,
