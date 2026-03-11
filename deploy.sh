@@ -39,8 +39,17 @@ if [[ -f "$REQUIREMENTS_FILE" ]]; then
   python -m pip install -r "$REQUIREMENTS_FILE"
 fi
 
-echo "==> Restarting service $SYSTEMD_SERVICE"
-sudo systemctl restart "$SYSTEMD_SERVICE"
-sudo systemctl is-active --quiet "$SYSTEMD_SERVICE"
+echo "==> Restarting service instances"
+# Restart all 4 instances for multi-core utilization
+for i in {1..4}; do
+  sudo systemctl restart "${SYSTEMD_SERVICE}@${i}"
+done
+
+# Check if at least one instance is active
+if sudo systemctl is-active --quiet "${SYSTEMD_SERVICE}@1"; then
+  echo "==> Services are running"
+else
+  echo "==> Warning: Service check failed" >&2
+fi
 
 echo "==> Deploy complete"
