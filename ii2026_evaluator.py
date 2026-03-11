@@ -1448,25 +1448,47 @@ def build_system_prompt(model: str) -> str:
     return SYSTEM_PROMPT
 
 
+def reserved_output_tokens(model: str) -> int:
+    return 1024 if model.startswith("gpt-5") else RESERVED_OUTPUT_TOKENS
+
+
 def model_supports_temperature(model: str) -> bool:
     return not model.startswith("gpt-5")
 
 
 def request_openai_completion(client: OpenAI, messages: list[dict[str, str]], model: str) -> str:
+    max_completion_tokens = reserved_output_tokens(model)
     request_kwargs: dict[str, Any] = {
         "model": model,
-        "max_completion_tokens": RESERVED_OUTPUT_TOKENS,
+        "max_completion_tokens": max_completion_tokens,
         "messages": cast(Any, messages),
         "response_format": {"type": "json_object"},
     }
     if model_supports_temperature(model):
         request_kwargs["temperature"] = 0.0
+    else:
+        request_kwargs["reasoning_effort"] = "minimal"
 
     response = client.chat.completions.create(**request_kwargs)
-    raw_content = response.choices[0].message.content
-    if not raw_content:
-        raise ValueError("Model returned empty content.")
-    return raw_content
+    choice = response.choices[0]
+    raw_content = (choice.message.content or "").strip()
+    if raw_content:
+        return raw_content
+
+    if choice.finish_reason == "length":
+        retry_kwargs = {**request_kwargs, "max_completion_tokens": max(max_completion_tokens * 2, 1024)}
+        retry_response = client.chat.completions.create(**retry_kwargs)
+        retry_choice = retry_response.choices[0]
+        retry_content = (retry_choice.message.content or "").strip()
+        if retry_content:
+            return retry_content
+        if retry_choice.finish_reason == "length":
+            raise ValueError("Model exhausted completion budget before producing output.")
+
+    refusal = getattr(choice.message, "refusal", None)
+    if refusal:
+        raise ValueError(f"Model refusal: {str(refusal)[:120]}")
+    raise ValueError("Model returned empty content.")
 
 
 def call_openai(user_prompt: str, api_key: str, model: str) -> dict[str, Any]:
@@ -2111,7 +2133,7 @@ if trigger:
                     st.warning(f"{file_name}: stripped potentially injected prompt lines: {preview}")
 
                 system_prompt = build_system_prompt(model_choice)
-                max_input = MODEL_CONTEXT_WINDOWS[model_choice] - RESERVED_OUTPUT_TOKENS - SAFETY_MARGIN_TOKENS
+                max_input = MODEL_CONTEXT_WINDOWS[model_choice] - reserved_output_tokens(model_choice) - SAFETY_MARGIN_TOKENS
                 static_token_cost = count_tokens(system_prompt, model_choice) + count_tokens(
                     build_eval_prompt("", ps_key, ps_text, ps_extracted),
                     model_choice,
