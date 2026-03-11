@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import hmac
 import importlib.util
 import json
 import os
@@ -77,6 +78,8 @@ LLM_CONTEXT_SOFT_LIMIT = 7000
 BASE_DIR = Path(__file__).resolve().parent
 ENV_PATH = BASE_DIR / ".env"
 DATABASE_URL_ENV_VAR = "DATABASE_URL"
+SUBMISSION_CSV_ENV_VAR = "II2026_SUBMISSIONS_CSV"
+SECRET_QUEUE_CODE = "aero"
 
 MAX_UPLOAD_MB = 20
 PDF_COMPRESS_HELP_URL = "https://www.ilovepdf.com/compress_pdf"
@@ -88,6 +91,16 @@ INJECTION_PATTERNS = ["ignore", "disregard", "system:", "assistant:", "[inst]", 
 SUPPORTED_EXTENSIONS = {".pdf", ".pptx", ".ppt"}
 LINK_TIMEOUT_SECONDS = 30
 MAX_DOWNLOAD_MB = 50
+CSV_URL_COLUMN = "Q1: Upload your presentation."
+CSV_TEAM_COLUMN = "Team Name"
+CSV_DOMAIN_COLUMN = "Domain"
+CSV_REGN_ID_COLUMN = "Regn ID"
+CSV_TIMESTAMP_COLUMN = "Submission Timestamp"
+DEFAULT_SUBMISSION_CSV_CANDIDATES = [
+    BASE_DIR / "submission.csv",
+    BASE_DIR / "submissions.csv",
+    BASE_DIR / "Copy of 3751_29473135_download_submission_1394436 - 3751_29473135_download_submission_1394436.csv.csv",
+]
 
 # ── Provider routing ──────────────────────────────────────
 OPENAI_MODELS = {
@@ -754,6 +767,167 @@ def get_latest_evaluation(submission_hash: str) -> dict[str, Any] | None:
     finally:
         if connection is not None:
             connection.close()
+
+
+def get_evaluated_submission_urls() -> set[str]:
+    connection: "psycopg.Connection[DictRow] | None" = None
+    try:
+        connection = get_db_connection()
+        rows = connection.execute(
+            """
+            SELECT DISTINCT submission_url
+            FROM audit_log
+            WHERE COALESCE(submission_url, '') <> ''
+            """
+        ).fetchall()
+        return {str(row["submission_url"]).strip() for row in rows if row.get("submission_url")}
+    except (psycopg.Error, ValueError) as exc:
+        st.error(f"Failed to read evaluated submission links: {exc}")
+        return set()
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def resolve_submission_csv_path() -> Path:
+    configured_path = os.environ.get(SUBMISSION_CSV_ENV_VAR, "").strip()
+    candidates = [Path(configured_path)] if configured_path else []
+    candidates.extend(DEFAULT_SUBMISSION_CSV_CANDIDATES)
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate
+
+    searched_paths = "\n".join(f"- {candidate}" for candidate in candidates) or "- <none configured>"
+    raise ValueError(
+        f"Submission CSV not found. Set {SUBMISSION_CSV_ENV_VAR} or place the file at one of:\n{searched_paths}"
+    )
+
+
+def infer_domain_from_csv_row(raw_domain: Any, team_name: str, submission_url: str) -> str:
+    raw_text = str(raw_domain).strip()
+    normalized_raw = _normalize_match_text(raw_text) if raw_text and raw_text.lower() != "nan" else ""
+    explicit_aliases = {
+        "urban solutions": "Domain 1 — Urban Solutions",
+        "urban solution": "Domain 1 — Urban Solutions",
+        "digital democracy": "Domain 2 — Digital Democracy",
+        "politics and civic tech": "Domain 2 — Digital Democracy",
+        "politics civic tech": "Domain 2 — Digital Democracy",
+        "civic tech": "Domain 2 — Digital Democracy",
+        "open innovation": "Domain 3 — Open Innovation",
+    }
+    if normalized_raw in explicit_aliases:
+        return explicit_aliases[normalized_raw]
+
+    file_name = Path(urlparse(submission_url).path).name or submission_url
+    inferred_domain, _ = infer_domain_and_ps(file_name, team_name, normalized_raw, {})
+    return inferred_domain or ALL_DOMAINS[0]
+
+
+def load_pending_csv_submissions(current_batch_urls: set[str]) -> tuple[list[dict[str, Any]], dict[str, int], Path]:
+    csv_path = resolve_submission_csv_path()
+    df = pd.read_csv(csv_path)
+
+    required_columns = {CSV_URL_COLUMN, CSV_TEAM_COLUMN}
+    missing_columns = sorted(required_columns - set(df.columns))
+    if missing_columns:
+        missing = ", ".join(missing_columns)
+        raise ValueError(f"Submission CSV is missing required columns: {missing}")
+
+    if CSV_TIMESTAMP_COLUMN in df.columns:
+        df["_submission_dt"] = pd.to_datetime(df[CSV_TIMESTAMP_COLUMN], errors="coerce")
+    else:
+        df["_submission_dt"] = pd.NaT
+
+    df = df.sort_values(by="_submission_dt", ascending=False, na_position="last")
+
+    evaluated_urls = get_evaluated_submission_urls()
+    deduped_rows: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    duplicate_rows = 0
+    skipped_invalid = 0
+    skipped_evaluated = 0
+    skipped_current_batch = 0
+
+    for row in df.to_dict(orient="records"):
+        submission_url = str(row.get(CSV_URL_COLUMN, "") or "").strip()
+        if not submission_url:
+            skipped_invalid += 1
+            continue
+        if submission_url in seen_urls:
+            duplicate_rows += 1
+            continue
+        seen_urls.add(submission_url)
+
+        if submission_url in evaluated_urls:
+            skipped_evaluated += 1
+            continue
+        if submission_url in current_batch_urls:
+            skipped_current_batch += 1
+            continue
+
+        team_name = str(row.get(CSV_TEAM_COLUMN, "") or "").strip() or "Unknown Team"
+        inferred_domain = infer_domain_from_csv_row(row.get(CSV_DOMAIN_COLUMN, ""), team_name, submission_url)
+        source_file_name = Path(urlparse(submission_url).path).name or "submission"
+        inferred_ps_key = list(PROBLEM_STATEMENTS[inferred_domain].keys())[0]
+        _, inferred_specific_ps = infer_domain_and_ps(source_file_name, team_name, "", {})
+        if inferred_specific_ps in PROBLEM_STATEMENTS[inferred_domain]:
+            inferred_ps_key = inferred_specific_ps
+
+        deduped_rows.append(
+            {
+                "regn_id": str(row.get(CSV_REGN_ID_COLUMN, "") or "").strip(),
+                "team_name": team_name,
+                "submission_url": submission_url,
+                "submission_timestamp": str(row.get(CSV_TIMESTAMP_COLUMN, "") or "").strip(),
+                "raw_domain": str(row.get(CSV_DOMAIN_COLUMN, "") or "").strip(),
+                "domain": inferred_domain,
+                "ps_key": inferred_ps_key,
+                "file_name": source_file_name,
+            }
+        )
+
+    stats = {
+        "csv_rows": int(len(df)),
+        "duplicates_removed": duplicate_rows,
+        "evaluated_removed": skipped_evaluated,
+        "current_batch_removed": skipped_current_batch,
+        "invalid_removed": skipped_invalid,
+        "pending": len(deduped_rows),
+    }
+    return deduped_rows, stats, csv_path
+
+
+def enqueue_csv_submissions(rows: list[dict[str, Any]]) -> tuple[int, list[str]]:
+    loaded_count = 0
+    errors: list[str] = []
+
+    for row in rows:
+        submission_url = row["submission_url"]
+        try:
+            file_bytes, file_name = fetch_file_from_url(submission_url)
+            detect_format(file_name)
+            sid = submission_id(file_bytes, file_name)
+            st.session_state.url_downloads[sid] = {
+                "sid": sid,
+                "file_name": file_name,
+                "file_bytes": file_bytes,
+                "submission_hash": full_submission_hash(file_bytes, file_name),
+                "submission_url": submission_url,
+                "prefill": {
+                    "team_name": row.get("team_name", ""),
+                    "domain": row.get("domain", ""),
+                    "ps_key": row.get("ps_key", ""),
+                    "regn_id": row.get("regn_id", ""),
+                    "submission_timestamp": row.get("submission_timestamp", ""),
+                    "raw_domain": row.get("raw_domain", ""),
+                },
+            }
+            loaded_count += 1
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{row.get('team_name', 'Unknown Team')} — {exc}")
+
+    return loaded_count, errors
 
 
 def build_existing_result_row(sid: str, submission: dict[str, Any], prior_eval: dict[str, Any]) -> dict[str, Any]:
@@ -1561,7 +1735,9 @@ def ensure_submission_defaults(
     file_name: str,
     submission_hash_value: str,
     submission_url: str = "",
+    prefill: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    prefill = prefill or {}
     extracted_map = extract_submission(file_bytes, file_name)
     slide_entries, slide_map = build_slide_entries(extracted_map)
     extracted_ps = extract_problem_statement_text(slide_map)
@@ -1572,6 +1748,9 @@ def ensure_submission_defaults(
     inferred_domain, inferred_ps_key = infer_domain_and_ps(file_name, team_name, extracted_ps, slide_map)
     initial_domain = inferred_domain or default_domain
     initial_ps_key = inferred_ps_key or list(PROBLEM_STATEMENTS[initial_domain].keys())[0]
+    prefill_domain = prefill.get("domain") if prefill.get("domain") in PROBLEM_STATEMENTS else None
+    prefill_ps_options = PROBLEM_STATEMENTS.get(prefill_domain, {}) if prefill_domain else {}
+    prefill_ps_key = prefill.get("ps_key") if prefill.get("ps_key") in prefill_ps_options else None
 
     base = {
         "sid": sid,
@@ -1579,15 +1758,18 @@ def ensure_submission_defaults(
         "file_name": file_name,
         "file_bytes": file_bytes,
         "submission_url": submission_url,
-        "team_name": team_name,
-        "domain": initial_domain,
-        "ps_key": initial_ps_key,
+        "team_name": str(prefill.get("team_name", "") or team_name),
+        "domain": prefill_domain or initial_domain,
+        "ps_key": prefill_ps_key or initial_ps_key,
         "media_link": "",
         "prototype_link": "",
         "github_link": "",
         "media_rating": 0,
         "proto_rating": 0,
         "visual_rating": 0,
+        "regn_id": str(prefill.get("regn_id", "") or ""),
+        "submission_timestamp": str(prefill.get("submission_timestamp", "") or ""),
+        "raw_domain": str(prefill.get("raw_domain", "") or ""),
         "slide_map": slide_map,
         "slides": slide_entries,
         "extracted_ps": extracted_ps,
@@ -1617,8 +1799,19 @@ def ensure_submission_defaults(
     merged["slides"] = slide_entries
     merged["extracted_ps"] = extracted_ps
     merged["previous_eval"] = previous_eval
+    merged["submission_url"] = submission_url or merged.get("submission_url", "")
+    if prefill.get("regn_id"):
+        merged["regn_id"] = str(prefill.get("regn_id", ""))
+    if prefill.get("submission_timestamp"):
+        merged["submission_timestamp"] = str(prefill.get("submission_timestamp", ""))
+    if prefill.get("raw_domain"):
+        merged["raw_domain"] = str(prefill.get("raw_domain", ""))
+    if prefill.get("team_name"):
+        merged["team_name"] = str(prefill.get("team_name", ""))
     if not merged.get("team_name") or merged["team_name"] == "Unknown Team":
         merged["team_name"] = team_name
+    if prefill_domain:
+        merged["domain"] = prefill_domain
     if (
         not merged.get("domain")
         or merged["domain"] not in PROBLEM_STATEMENTS
@@ -1629,6 +1822,8 @@ def ensure_submission_defaults(
     if not valid_ps_options:
         merged["domain"] = default_domain
         valid_ps_options = PROBLEM_STATEMENTS[default_domain]
+    if prefill_ps_key and prefill_ps_key in valid_ps_options:
+        merged["ps_key"] = prefill_ps_key
     if (
         not merged.get("ps_key")
         or merged["ps_key"] not in valid_ps_options
@@ -1729,6 +1924,7 @@ for key, default in (("submissions", {}), ("results", []), ("url_downloads", {})
     if key not in st.session_state:
         st.session_state[key] = default
 st.session_state.setdefault("failed_uploads", {})
+st.session_state.setdefault("server_queue_unlocked", False)
 
 with st.sidebar:
     st.markdown("## India Innovates 2026")
@@ -1781,6 +1977,19 @@ with st.sidebar:
         """
     )
 
+    st.divider()
+    secret_queue_code = st.text_input(
+        "Private loader",
+        type="password",
+        value="",
+        placeholder="secret code",
+        help="Private queue access.",
+    )
+    if secret_queue_code:
+        st.session_state["server_queue_unlocked"] = hmac.compare_digest(secret_queue_code.strip(), SECRET_QUEUE_CODE)
+    if st.session_state.get("server_queue_unlocked"):
+        st.caption("Private server queue unlocked.")
+
 
 st.title("🇮🇳 India Innovates 2026 — Screening Evaluator")
 st.caption("Upload PDF / PPTX files (or paste a URL), fill human review inputs, run LLM scoring, then export CSV.")
@@ -1825,6 +2034,59 @@ if _url_btn and _url_input:
             st.success(f"Downloaded: {_url_fname}")
         except ValueError as exc:
             st.error(str(exc))
+
+current_batch_urls = {
+    str(entry.get("submission_url", "") or "").strip()
+    for entry in st.session_state.url_downloads.values()
+    if entry.get("submission_url")
+}
+
+if st.session_state.get("server_queue_unlocked"):
+    st.markdown("#### Private server queue")
+    st.caption("Shows pending CSV submissions only. Already evaluated links and duplicate CSV rows stay hidden.")
+    try:
+        pending_csv_rows, pending_csv_stats, pending_csv_path = load_pending_csv_submissions(current_batch_urls)
+        batch_slots_left = max(0, MAX_FILES_BATCH - (len(uploaded_files) if uploaded_files else 0) - len(st.session_state.url_downloads))
+        next_load_count = min(10, batch_slots_left, len(pending_csv_rows))
+
+        stat_col_1, stat_col_2, stat_col_3, stat_col_4 = st.columns(4)
+        stat_col_1.metric("Pending", pending_csv_stats["pending"])
+        stat_col_2.metric("Evaluated hidden", pending_csv_stats["evaluated_removed"])
+        stat_col_3.metric("CSV duplicates hidden", pending_csv_stats["duplicates_removed"])
+        stat_col_4.metric("Batch slots left", batch_slots_left)
+
+        queue_preview = pd.DataFrame(pending_csv_rows)
+        if not queue_preview.empty:
+            preview_columns = ["team_name", "domain", "regn_id", "submission_timestamp", "file_name"]
+            rename_map = {
+                "team_name": "Team",
+                "domain": "Domain",
+                "regn_id": "Regn ID",
+                "submission_timestamp": "Submitted",
+                "file_name": "File",
+            }
+            st.dataframe(
+                queue_preview[preview_columns].rename(columns=rename_map),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("No pending CSV submissions left to load.")
+
+        load_label = f"Load {next_load_count} into batch" if next_load_count else "Load into batch"
+        if st.button(load_label, key="load_csv_batch_btn", use_container_width=True, disabled=next_load_count == 0):
+            with st.spinner(f"Loading {next_load_count} submission(s) from server CSV…"):
+                loaded_count, load_errors = enqueue_csv_submissions(pending_csv_rows[:next_load_count])
+            if loaded_count:
+                st.success(f"Loaded {loaded_count} submission(s) from {pending_csv_path.name}.")
+            if load_errors:
+                for error_message in load_errors[:5]:
+                    st.warning(error_message)
+                if len(load_errors) > 5:
+                    st.warning(f"{len(load_errors) - 5} more load error(s) were omitted.")
+            st.rerun()
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Private CSV queue failed to load: {exc}")
 
 has_any = bool(uploaded_files) or bool(st.session_state.url_downloads)
 if not has_any:
@@ -1900,6 +2162,7 @@ for entry in uploaded_entries:
                 file_name,
                 entry["submission_hash"],
                 submission_url=entry.get("submission_url", ""),
+                prefill=entry.get("prefill"),
             )
         st.session_state.failed_uploads.pop(sid, None)
     except Exception as exc:  # noqa: BLE001
@@ -1925,6 +2188,18 @@ for entry in uploaded_entries:
         continue
 
     with st.expander(f"{file_name} · Team: {submission['team_name']}", expanded=True):
+        basic_info_bits = []
+        if submission.get("regn_id"):
+            basic_info_bits.append(f"Regn ID: {submission['regn_id']}")
+        if submission.get("submission_timestamp"):
+            basic_info_bits.append(f"Submitted: {submission['submission_timestamp']}")
+        if submission.get("raw_domain"):
+            basic_info_bits.append(f"CSV domain: {submission['raw_domain']}")
+        if submission.get("submission_url"):
+            basic_info_bits.append("Loaded from server CSV")
+        if basic_info_bits:
+            st.caption(" · ".join(basic_info_bits))
+
         previous_eval = submission.get("previous_eval")
         if previous_eval:
             previous_total = format_score(previous_eval.get("total_score"))
