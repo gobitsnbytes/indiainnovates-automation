@@ -13,10 +13,15 @@ Otherwise, total is capped at 1.00. IN threshold is 0.60.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
+import importlib.util
 import json
+import os
 import re
 import sqlite3
+import subprocess
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -26,6 +31,39 @@ from pathlib import Path
 from typing import Any, cast
 from urllib.parse import urlparse
 
+AUTO_INSTALL_PACKAGES = [
+    ("streamlit", "streamlit"),
+    ("pandas", "pandas"),
+    ("tiktoken", "tiktoken"),
+    ("openai", "openai"),
+    ("pptx", "python-pptx"),
+    ("pypdf", "pypdf>=4.0"),
+    ("pdfplumber", "pdfplumber"),
+    ("PIL", "Pillow"),
+    ("pytesseract", "pytesseract"),
+    ("pdf2image", "pdf2image"),
+    ("pyzipper", "pyzipper"),
+]
+
+
+def ensure_python_packages() -> None:
+    missing = [
+        package_spec
+        for module_name, package_spec in AUTO_INSTALL_PACKAGES
+        if importlib.util.find_spec(module_name) is None
+    ]
+    if not missing:
+        return
+
+    subprocess.run(  # noqa: S603
+        [sys.executable, "-m", "pip", "install", *missing],
+        check=True,
+    )
+
+
+ensure_python_packages()
+
+import openai
 import pandas as pd
 import streamlit as st
 import tiktoken
@@ -33,11 +71,11 @@ from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
 from pptx import Presentation
 
 IN_THRESHOLD = 0.60
-MAX_FILES_BATCH = 10
 MAX_PPT_TOKENS = 3000
 LLM_CONTEXT_SOFT_LIMIT = 7000
 BASE_DIR = Path(__file__).resolve().parent
 DB_PATH = BASE_DIR / "selected.db"
+ENV_PATH = BASE_DIR / ".env"
 
 MAX_UPLOAD_MB = 20
 MIN_TEXT_CHARS = 80
@@ -49,14 +87,44 @@ INJECTION_PATTERNS = ["ignore", "disregard", "system:", "assistant:", "[inst]", 
 SUPPORTED_EXTENSIONS = {".pdf", ".pptx", ".ppt"}
 LINK_TIMEOUT_SECONDS = 30
 MAX_DOWNLOAD_MB = 50
+
+# ── Provider routing ──────────────────────────────────────
+ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1/"
+
+ANTHROPIC_MODELS = {
+    "claude-sonnet-4-5",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+}
+
+OPENAI_MODELS = {
+    "gpt-5-mini",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+    "gpt-4o",
+    "gpt-4o-mini",
+}
+
 MODEL_CONTEXT_WINDOWS = {
     "gpt-5-mini": 400_000,
     "gpt-4.1": 1_000_000,
     "gpt-4.1-mini": 1_000_000,
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
+    "claude-sonnet-4-5": 200_000,
+    "claude-sonnet-4-6": 200_000,
+    "claude-haiku-4-5-20251001": 200_000,
 }
-MODEL_OPTIONS = list(MODEL_CONTEXT_WINDOWS.keys())
+MODEL_OPTIONS = [
+    "claude-sonnet-4-6",
+    "claude-sonnet-4-5",
+    "claude-haiku-4-5-20251001",
+    "gpt-5-mini",
+    "gpt-4.1-mini",
+    "gpt-4.1",
+    "gpt-4o",
+    "gpt-4o-mini",
+]
 
 MEDIA_SCORE_MAP = {0: 0.00, 1: 0.10, 5: 0.25}
 PROTO_SCORE_MAP = {0: 0.00, 1: 0.10, 5: 0.35}
@@ -105,6 +173,59 @@ PLACEHOLDER_FINGERPRINTS = {
     "feature / usp",
     "feature/usp",
 }
+
+# ── PS extraction constants ───────────────────────────────
+_PS_SLIDE_ALIASES = {
+    "problem statement",
+    "problem",
+    "the problem",
+    "problem definition",
+    "problem overview",
+    "identified problem",
+    "issue",
+    "challenge",
+    "problem & background",
+    "background",
+    "context",
+}
+
+_PS_INLINE_LABELS = re.compile(
+    r"""
+    (?:
+        problem\s*statement   |
+        the\s+problem         |
+        problem\s*definition  |
+        identified\s*problem  |
+        problem\s*overview    |
+        challenge
+    )
+    \s*[:\-–—]?\s*
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_TEMPLATE_GARBAGE = re.compile(
+    r"""
+    clearly\s+define\s+the\s+real.world\s+challenge   |
+    highlight\s+the\s+existing\s+gaps                 |
+    explain\s+why\s+this\s+problem                    |
+    describe\s+your\s+proposed\s+approach             |
+    focus\s+on\s+innovation                           |
+    what\s+makes\s+your\s+idea\s+stand\s+out
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+_DOMAIN_KEYWORDS = re.compile(
+    r"""
+    urban\s+flood|aq[i1]|air\s+quality|waste|traffic|ambulance|
+    blockchain|e.?voting|sentiment|geo.?fenc|avatar|calling\s+agent|
+    booth|ontology|crm|grievance|co.?pilot|worker\s+management|
+    healthcare|agriculture|fintech|cybersecurity|edtech|sustainability|
+    robotics|deep.?tech|smart\s+governance
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 PROBLEM_STATEMENTS: dict[str, dict[str, str]] = {
     "Domain 1 — Urban Solutions": {
@@ -512,6 +633,31 @@ def normalize_whitespace(text: str) -> str:
     return "\n".join(line.strip() for line in text.splitlines() if line.strip())
 
 
+def load_env_file(env_path: Path) -> None:
+    """Load simple KEY=VALUE pairs from a local .env file into os.environ."""
+    if not env_path.exists():
+        return
+
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+
+            if not key:
+                continue
+            if value and value[0] == value[-1] and value[0] in {'"', "'"}:
+                value = value[1:-1]
+
+            os.environ.setdefault(key, value)
+    except OSError:
+        return
+
+
 def is_placeholder_text(text: str) -> bool:
     normalized = normalize_whitespace(text)
     if not normalized:
@@ -634,7 +780,10 @@ def extract_pptx_text(file_bytes: bytes) -> dict[str, str]:
         for shape in slide.shapes:
             if not shape.has_text_frame:
                 continue
-            for paragraph in shape.text_frame.paragraphs:
+            text_frame = getattr(shape, "text_frame", None)
+            if text_frame is None:
+                continue
+            for paragraph in text_frame.paragraphs:
                 text = paragraph.text.strip()
                 if text:
                     parts.append(text)
@@ -780,6 +929,115 @@ def build_slide_entries(slide_map: dict[str, str]) -> tuple[list[dict[str, Any]]
     return slide_entries, truncated_map
 
 
+def _strip_template_garbage(text: str) -> str:
+    """Remove template instruction lines from content."""
+    lines = text.splitlines()
+    cleaned = [line for line in lines if not _TEMPLATE_GARBAGE.search(line)]
+    return "\n".join(cleaned).strip()
+
+
+def _take_until_next_heading(text: str) -> str:
+    """
+    From an inline-extracted block, take text until what looks like
+    the next section heading (all-caps line, or line ending in ':').
+    """
+    lines = text.splitlines()
+    result: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            result.append(line)
+            continue
+        is_heading = (
+            (stripped.isupper() and len(stripped) > 3)
+            or (stripped.endswith(":") and len(stripped.split()) <= 5)
+        )
+        if is_heading and result:
+            break
+        result.append(line)
+    return "\n".join(result).strip()
+
+
+def extract_problem_statement_text(slides: dict[str, str]) -> str:
+    """
+    Multi-stage extraction of the actual problem statement content.
+    Returns the best candidate string found, or empty string if nothing useful.
+
+    Stage 1 — exact SLIDE_LABELS match
+    Stage 2 — fuzzy slide label match (handles renamed slides)
+    Stage 3 — inline label regex across all slides
+    Stage 4 — domain keyword density scoring across all slides
+    Stage 5 — semantic fallback (longest substantive non-template paragraph)
+    """
+    for label, content in slides.items():
+        if label.upper() == "PROBLEM STATEMENT":
+            cleaned = _strip_template_garbage(content)
+            if len(cleaned.strip()) > 60:
+                return cleaned.strip()
+
+    all_labels = [label.lower() for label in slides.keys()]
+    for alias in _PS_SLIDE_ALIASES:
+        matches = difflib.get_close_matches(alias, all_labels, n=1, cutoff=0.72)
+        if matches:
+            matched_label = list(slides.keys())[all_labels.index(matches[0])]
+            cleaned = _strip_template_garbage(slides[matched_label])
+            if len(cleaned.strip()) > 60:
+                return cleaned.strip()
+
+    for label, content in slides.items():
+        if label.upper() in {"COVER / TEAM INFO", "THANK YOU"}:
+            continue
+        match = _PS_INLINE_LABELS.search(content)
+        if match:
+            after = content[match.end():].strip()
+            candidate = _take_until_next_heading(after)
+            cleaned = _strip_template_garbage(candidate)
+            if len(cleaned.strip()) > 60:
+                return cleaned.strip()
+
+    best_score = 0.0
+    best_content = ""
+    for label, content in slides.items():
+        if label.upper() in {"COVER / TEAM INFO", "THANK YOU", "REFERENCES / LINKS"}:
+            continue
+        if _TEMPLATE_GARBAGE.search(content):
+            continue
+        hits = len(_DOMAIN_KEYWORDS.findall(content))
+        word_count = len(content.split())
+        if word_count < 10:
+            continue
+        score = (hits / max(word_count, 1)) * 100
+        if score > best_score:
+            best_score = score
+            best_content = content
+    if best_score > 1.5 and len(best_content.strip()) > 60:
+        return _strip_template_garbage(best_content).strip()
+
+    has_verb = re.compile(
+        r"\b(is|are|was|were|will|would|should|can|could|"
+        r"develop|build|create|solve|address|enable|provide|"
+        r"detect|identify|manage|track|reduce|improve|allow)\b",
+        re.IGNORECASE,
+    )
+    candidates: list[str] = []
+    for label, content in slides.items():
+        if label.upper() in {"COVER / TEAM INFO", "THANK YOU"}:
+            continue
+        for paragraph in re.split(r"\n{2,}", content):
+            paragraph = paragraph.strip()
+            if len(paragraph) < 80:
+                continue
+            if _TEMPLATE_GARBAGE.search(paragraph):
+                continue
+            if has_verb.search(paragraph):
+                candidates.append(paragraph)
+
+    if candidates:
+        return max(candidates, key=len)[:1500]
+
+    return ""
+
+
 def try_extract_team_name(slides: dict[str, str]) -> str:
     cover = slides.get("COVER / TEAM INFO", "") or slides.get("PAGE_1", "")
 
@@ -854,11 +1112,17 @@ def sanitize_ppt_content_for_prompt(ppt_content: str) -> tuple[str, list[str]]:
     return "\n".join(kept_lines), stripped_lines
 
 
-def build_eval_prompt(ppt_content: str, ps_key: str, ps_text: str) -> str:
+def build_eval_prompt(ppt_content: str, ps_key: str, ps_text: str, ps_extracted: str = "") -> str:
     return f"""
 PROBLEM STATEMENT SELECTED BY HUMAN REVIEWER
 ID: {ps_key}
 TEXT: {ps_text}
+
+═══════════════════════════════════════════════
+EXTRACTED PROBLEM STATEMENT SLIDE CONTENT
+(auto-extracted from participant's submission — may be partial)
+{ps_extracted if ps_extracted else "[Could not extract — evaluate from full PPT content below]"}
+═══════════════════════════════════════════════
 
 PPT CONTENT EXTRACT
 <UNTRUSTED_SUBMISSION_CONTENT>
@@ -955,24 +1219,49 @@ def parse_and_validate_llm_response(raw_content: str) -> dict[str, Any]:
     return parsed
 
 
+def build_system_prompt(model: str) -> str:
+    if model in ANTHROPIC_MODELS:
+        return f"{SYSTEM_PROMPT}\nRespond only with valid JSON. No preamble, no markdown fences."
+    return SYSTEM_PROMPT
+
+
 def request_openai_completion(client: OpenAI, messages: list[dict[str, str]], model: str) -> str:
-    response = client.chat.completions.create(
-        model=model,
-        temperature=0.0,
-        max_completion_tokens=RESERVED_OUTPUT_TOKENS,
-        response_format={"type": "json_object"},
-        messages=cast(Any, messages),
-    )
+    request_kwargs: dict[str, Any] = {
+        "model": model,
+        "temperature": 0.0,
+        "max_completion_tokens": RESERVED_OUTPUT_TOKENS,
+        "messages": cast(Any, messages),
+    }
+    if model not in ANTHROPIC_MODELS:
+        request_kwargs["response_format"] = {"type": "json_object"}
+
+    response = client.chat.completions.create(**request_kwargs)
     raw_content = response.choices[0].message.content
     if not raw_content:
         raise ValueError("Model returned empty content.")
     return raw_content
 
 
-def call_openai_for_scores(user_prompt: str, api_key: str, model: str) -> dict[str, Any]:
-    client = OpenAI(api_key=api_key)
+def call_openai(user_prompt: str, api_key: str, model: str, anthropic_key: str = "") -> dict[str, Any]:
+    """Route to correct provider via OpenAI SDK. Anthropic uses its OpenAI-compatible endpoint."""
+    is_anthropic = model in ANTHROPIC_MODELS
+
+    if is_anthropic:
+        if not anthropic_key:
+            raise ValueError("Anthropic API key required for Claude models")
+        client = openai.OpenAI(
+            api_key=anthropic_key,
+            base_url=ANTHROPIC_BASE_URL,
+        )
+    else:
+        if not api_key:
+            raise ValueError("OpenAI API key required for GPT models")
+        client = openai.OpenAI(api_key=api_key)
+
+    system_prompt = build_system_prompt(model)
+
     base_messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
 
@@ -994,10 +1283,10 @@ def call_openai_for_scores(user_prompt: str, api_key: str, model: str) -> dict[s
             return error_result("MODEL_OUTPUT_INVALID: scores out of allowed set")
 
 
-def safe_call_openai(user_prompt: str, api_key: str, model: str) -> dict[str, Any]:
+def safe_call_openai(user_prompt: str, api_key: str, anthropic_key: str, model: str) -> dict[str, Any]:
     for attempt in range(3):
         try:
-            return call_openai_for_scores(user_prompt, api_key, model)
+            return call_openai(user_prompt, api_key, model, anthropic_key)
         except RateLimitError:
             if attempt == 2:
                 return error_result("Rate limit hit after 3 attempts.")
@@ -1021,6 +1310,7 @@ def ensure_submission_defaults(
 ) -> dict[str, Any]:
     extracted_map = extract_submission(file_bytes, file_name)
     slide_entries, slide_map = build_slide_entries(extracted_map)
+    extracted_ps = extract_problem_statement_text(slide_map)
     team_name = try_extract_team_name(slide_map)
     default_domain = ALL_DOMAINS[0]
     default_ps_key = list(PROBLEM_STATEMENTS[default_domain].keys())[0]
@@ -1042,6 +1332,7 @@ def ensure_submission_defaults(
         "visual_rating": 0,
         "slide_map": slide_map,
         "slides": slide_entries,
+        "extracted_ps": extracted_ps,
         "ppt_payload": None,
         "present_required": [],
         "missing_required": [],
@@ -1062,6 +1353,7 @@ def ensure_submission_defaults(
     merged["file_bytes"] = file_bytes
     merged["slide_map"] = slide_map
     merged["slides"] = slide_entries
+    merged["extracted_ps"] = extracted_ps
     if not merged.get("team_name") or merged["team_name"] == "Unknown Team":
         merged["team_name"] = team_name
     merged["ppt_payload"], merged["present_required"], merged["missing_required"] = build_llm_ppt_payload(slide_map)
@@ -1148,6 +1440,7 @@ def highlight_eval_failed(row: pd.Series) -> list[str]:
     return [""] * len(row)
 
 
+load_env_file(ENV_PATH)
 init_db()
 st.set_page_config(page_title="India Innovates 2026 Evaluator", page_icon="🇮🇳", layout="wide")
 
@@ -1156,17 +1449,52 @@ for key, default in (("submissions", {}), ("results", []), ("url_downloads", {})
         st.session_state[key] = default
 st.session_state.setdefault("failed_uploads", {})
 
+default_openai_api_key = st.session_state.get("openai_api_key") or os.environ.get("OPENAI_API_KEY", "")
+default_anthropic_api_key = st.session_state.get("anthropic_api_key") or os.environ.get("ANTHROPIC_API_KEY", "")
+
 with st.sidebar:
     st.markdown("## India Innovates 2026")
     st.markdown("Batch screening evaluator")
     st.divider()
 
-    api_key = st.text_input("OpenAI API key", type="password", placeholder="sk-...")
+    openai_api_key = st.text_input(
+        "OpenAI API Key",
+        type="password",
+        placeholder="sk-...",
+        value=default_openai_api_key,
+    )
+    anthropic_api_key = st.text_input(
+        "Anthropic API Key",
+        type="password",
+        placeholder="sk-ant-...",
+        value=default_anthropic_api_key,
+    )
+    st.session_state["openai_api_key"] = openai_api_key
+    st.session_state["anthropic_api_key"] = anthropic_api_key
+
+    if os.environ.get("OPENAI_API_KEY"):
+        st.caption("OpenAI key loaded from environment.")
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        st.caption("Anthropic key loaded from environment.")
+
     model_choice = st.selectbox(
-        "Model",
-        options=["gpt-5-mini", "gpt-4.1-mini", "gpt-4.1", "gpt-4o", "gpt-4o-mini"],
+        "Evaluation Model",
+        options=[
+            "claude-sonnet-4-6",
+            "claude-sonnet-4-5",
+            "claude-haiku-4-5-20251001",
+            "gpt-5-mini",
+            "gpt-4.1-mini",
+            "gpt-4.1",
+            "gpt-4o",
+            "gpt-4o-mini",
+        ],
         index=0,
     )
+    provider = "Anthropic" if model_choice in ANTHROPIC_MODELS else "OpenAI"
+    st.caption(f"Provider: {provider} · Context: {MODEL_CONTEXT_WINDOWS[model_choice]:,} tokens")
+    MAX_FILES_BATCH = 15 if model_choice in ANTHROPIC_MODELS else 10
+    st.caption(f"Batch limit: {MAX_FILES_BATCH} files for this model")
 
     st.divider()
     st.markdown("### Marking scheme in use")
@@ -1425,6 +1753,18 @@ for entry in uploaded_entries:
         with st.expander("Extracted text preview", expanded=False):
             render_slide_preview(submission, sid)
 
+        if submission.get("extracted_ps"):
+            with st.expander("🎯 Extracted Problem Statement (preview)", expanded=False):
+                st.text_area(
+                    "",
+                    value=submission["extracted_ps"],
+                    height=120,
+                    disabled=True,
+                    key=f"ps_preview_{sid}",
+                )
+        else:
+            st.caption("⚠️ Problem statement could not be auto-extracted — full slide text will be used.")
+
         if submission.get("last_result_row"):
             last_result = submission["last_result_row"]
             if last_result["VERDICT"] == "EVAL_FAILED":
@@ -1439,184 +1779,195 @@ for entry in uploaded_entries:
             )
 
 st.header("Step 3 · Run LLM evaluation", divider="gray")
-if not api_key:
-    st.warning("Enter the OpenAI API key in the sidebar to evaluate submissions.")
-else:
-    trigger = st.button("Evaluate all submissions", type="primary", use_container_width=True)
-    st.caption(
-        f"Batch size: {len(st.session_state.submissions)} · Model: {model_choice} · "
-        f"PPT token budget per submission: {MAX_PPT_TOKENS}"
-    )
+trigger = st.button("Evaluate all submissions", type="primary", use_container_width=True)
+st.caption(
+    f"Batch size: {len(st.session_state.submissions)} · Model: {model_choice} · "
+    f"PPT token budget per submission: {MAX_PPT_TOKENS}"
+)
 
-    if trigger:
-        st.session_state.results = []
-        progress = st.progress(0, text="Preparing evaluations...")
-        status_box = st.empty()
-        failed_count = 0
+if trigger:
+    if model_choice in ANTHROPIC_MODELS and not anthropic_api_key:
+        st.error("❌ Anthropic API key required for Claude models. Enter it in the sidebar.")
+        st.stop()
+    if model_choice in OPENAI_MODELS and not openai_api_key:
+        st.error("❌ OpenAI API key required for GPT models. Enter it in the sidebar.")
+        st.stop()
 
-        items = uploaded_entries
-        for index, entry in enumerate(items, start=1):
-            sid = entry["sid"]
-            file_name = entry["file_name"]
-            if sid in st.session_state.failed_uploads:
-                status_box.warning(f"Skipping {file_name}: parse failed.")
-                progress.progress(index / len(items), text=f"Completed {index}/{len(items)}")
-                continue
+    st.session_state.results = []
+    progress = st.progress(0, text="Preparing evaluations...")
+    status_box = st.empty()
+    failed_count = 0
 
-            submission = st.session_state.submissions.get(sid)
-            if submission is None:
-                status_box.warning(f"Skipping {file_name}: submission state missing.")
-                progress.progress(index / len(items), text=f"Completed {index}/{len(items)}")
-                continue
+    items = uploaded_entries
+    for index, entry in enumerate(items, start=1):
+        sid = entry["sid"]
+        file_name = entry["file_name"]
+        if sid in st.session_state.failed_uploads:
+            status_box.warning(f"Skipping {file_name}: parse failed.")
+            progress.progress(index / len(items), text=f"Completed {index}/{len(items)}")
+            continue
 
-            status_box.info(f"Evaluating {index}/{len(items)}: {file_name}")
-            submission["model"] = model_choice
+        submission = st.session_state.submissions.get(sid)
+        if submission is None:
+            status_box.warning(f"Skipping {file_name}: submission state missing.")
+            progress.progress(index / len(items), text=f"Completed {index}/{len(items)}")
+            continue
 
-            try:
-                domain = submission["domain"]
-                ps_key = submission["ps_key"]
-                ps_text = PROBLEM_STATEMENTS[domain][ps_key]
-                media_score = MEDIA_SCORE_MAP.get(submission.get("media_rating", 0), 0.0)
-                proto_score = PROTO_SCORE_MAP.get(submission.get("proto_rating", 0), 0.0)
-                visual_score = VISUAL_BONUS_MAP.get(submission.get("visual_rating", 0), 0.0)
-                submission["prompt_red_flags"] = []
+        status_box.info(f"Evaluating {index}/{len(items)}: {file_name}")
+        submission["model"] = model_choice
 
-                if submission.get("proto_rating", 0) == 0:
-                    llm_result = {
-                        "ppt_score_raw": "SKIPPED",
-                        "alignment_score_raw": "SKIPPED",
-                        "ppt_verdict": "Skipped because Prototype + GitHub rating is 0.",
-                        "alignment_verdict": "Skipped because Prototype + GitHub rating is 0.",
-                        "red_flags": ["PROTO_GH_HARD_GATE_FAILED"],
-                    }
-                    result_row = build_result_row(
-                        sid,
-                        submission,
-                        llm_result,
-                        0.0,
-                        "AUTO-OUT",
-                        "SUCCESS",
-                        media_score,
-                        proto_score,
-                        0.0,
-                        0.0,
-                        visual_score,
-                    )
-                else:
-                    sanitized_payload, stripped_lines = sanitize_ppt_content_for_prompt(submission["ppt_payload"])
-                    submission["prompt_red_flags"] = ["PROMPT_INJECTION_STRIPPED"] if stripped_lines else []
-                    if stripped_lines:
-                        preview = " | ".join(stripped_lines[:3])
-                        st.warning(f"{file_name}: stripped potentially injected prompt lines: {preview}")
+        try:
+            domain = submission["domain"]
+            ps_key = submission["ps_key"]
+            ps_text = PROBLEM_STATEMENTS[domain][ps_key]
+            ps_extracted = submission.get("extracted_ps", "")
+            media_score = MEDIA_SCORE_MAP.get(submission.get("media_rating", 0), 0.0)
+            proto_score = PROTO_SCORE_MAP.get(submission.get("proto_rating", 0), 0.0)
+            visual_score = VISUAL_BONUS_MAP.get(submission.get("visual_rating", 0), 0.0)
+            submission["prompt_red_flags"] = []
 
-                    max_input = MODEL_CONTEXT_WINDOWS[model_choice] - RESERVED_OUTPUT_TOKENS - SAFETY_MARGIN_TOKENS
-                    static_token_cost = count_tokens(SYSTEM_PROMPT, model_choice) + count_tokens(
-                        build_eval_prompt("", ps_key, ps_text),
-                        model_choice,
-                    )
-                    ppt_token_budget = min(MAX_PPT_TOKENS, max_input - static_token_cost)
-                    if ppt_token_budget <= 0:
-                        llm_result = error_result("PROMPT_EXCEEDS_CONTEXT")
-                    else:
-                        truncated_payload = truncate_to_tokens(sanitized_payload, ppt_token_budget, model_choice)
-                        prompt = build_eval_prompt(truncated_payload, ps_key, ps_text)
-                        prompt_tokens = count_tokens(SYSTEM_PROMPT, model_choice) + count_tokens(prompt, model_choice)
-                        if prompt_tokens > max_input:
-                            llm_result = error_result("PROMPT_EXCEEDS_CONTEXT")
-                        else:
-                            llm_result = safe_call_openai(prompt, api_key, model_choice)
-
-                    eval_status = "FAILED" if "EVALUATION_FAILED" in llm_result.get("red_flags", []) else "SUCCESS"
-                    if eval_status == "FAILED":
-                        result_row = build_result_row(
-                            sid,
-                            submission,
-                            llm_result,
-                            None,
-                            "EVAL_FAILED",
-                            "FAILED",
-                            media_score,
-                            proto_score,
-                            None,
-                            None,
-                            visual_score,
-                        )
-                    else:
-                        scores = compute_final_score(
-                            submission["media_rating"],
-                            submission["proto_rating"],
-                            llm_result["ppt_score_raw"],
-                            llm_result["alignment_score_raw"],
-                            submission.get("visual_rating", 0),
-                        )
-                        verdict = "IN" if scores["total"] >= IN_THRESHOLD else "OUT"
-                        result_row = build_result_row(
-                            sid,
-                            submission,
-                            llm_result,
-                            scores["total"],
-                            verdict,
-                            "SUCCESS",
-                            scores["media_score"],
-                            scores["proto_score"],
-                            scores["ppt_score"],
-                            scores["align_score"],
-                            scores["visual_score"],
-                        )
-
-                submission["llm_result"] = llm_result
-                submission["last_result_row"] = result_row
-                st.session_state.results.append(result_row)
-
-                if result_row["Eval Status"] == "SUCCESS" and result_row["VERDICT"] == "IN":
-                    insert_selected(
-                        {
-                            "submission_hash": submission.get("submission_hash", ""),
-                            "team_name": submission.get("team_name", ""),
-                            "file_name": submission.get("file_name", ""),
-                            "domain": submission.get("domain", ""),
-                            "problem_stmt": submission.get("ps_key", ""),
-                            "media_score": result_row["Media Score"],
-                            "proto_score": result_row["Prototype Score"],
-                            "ppt_score": result_row["PPT Score"],
-                            "align_score": result_row["Alignment Score"],
-                            "visual_score": result_row["Visual Score"],
-                            "total_score": result_row["TOTAL"],
-                            "ppt_verdict": result_row["PPT Verdict"],
-                            "align_verdict": result_row["Alignment Verdict"],
-                            "red_flags": result_row["Red Flags"],
-                        }
-                    )
-
-                insert_audit_log(result_row)
-                if result_row["VERDICT"] == "EVAL_FAILED":
-                    failed_count += 1
-            except Exception as exc:  # noqa: BLE001
-                failed_count += 1
-                llm_result = error_result(str(exc))
+            if submission.get("proto_rating", 0) == 0:
+                llm_result = {
+                    "ppt_score_raw": "SKIPPED",
+                    "alignment_score_raw": "SKIPPED",
+                    "ppt_verdict": "Skipped because Prototype + GitHub rating is 0.",
+                    "alignment_verdict": "Skipped because Prototype + GitHub rating is 0.",
+                    "red_flags": ["PROTO_GH_HARD_GATE_FAILED"],
+                }
                 result_row = build_result_row(
                     sid,
                     submission,
                     llm_result,
-                    None,
-                    "EVAL_FAILED",
-                    "FAILED",
-                    MEDIA_SCORE_MAP.get(submission.get("media_rating", 0), 0.0),
-                    PROTO_SCORE_MAP.get(submission.get("proto_rating", 0), 0.0),
-                    None,
-                    None,
-                    VISUAL_BONUS_MAP.get(submission.get("visual_rating", 0), 0.0),
+                    0.0,
+                    "AUTO-OUT",
+                    "SUCCESS",
+                    media_score,
+                    proto_score,
+                    0.0,
+                    0.0,
+                    visual_score,
                 )
-                submission["llm_result"] = llm_result
-                submission["last_result_row"] = result_row
-                st.session_state.results.append(result_row)
-                insert_audit_log(result_row)
+            else:
+                sanitized_payload, stripped_lines = sanitize_ppt_content_for_prompt(submission["ppt_payload"])
+                submission["prompt_red_flags"] = ["PROMPT_INJECTION_STRIPPED"] if stripped_lines else []
+                if stripped_lines:
+                    preview = " | ".join(stripped_lines[:3])
+                    st.warning(f"{file_name}: stripped potentially injected prompt lines: {preview}")
 
-            progress.progress(index / len(items), text=f"Completed {index}/{len(items)}")
+                system_prompt = build_system_prompt(model_choice)
+                max_input = MODEL_CONTEXT_WINDOWS[model_choice] - RESERVED_OUTPUT_TOKENS - SAFETY_MARGIN_TOKENS
+                static_token_cost = count_tokens(system_prompt, model_choice) + count_tokens(
+                    build_eval_prompt("", ps_key, ps_text, ps_extracted),
+                    model_choice,
+                )
+                ppt_token_budget = min(MAX_PPT_TOKENS, max_input - static_token_cost)
+                if ppt_token_budget <= 0:
+                    llm_result = error_result("PROMPT_EXCEEDS_CONTEXT")
+                else:
+                    truncated_payload = truncate_to_tokens(sanitized_payload, ppt_token_budget, model_choice)
+                    prompt = build_eval_prompt(truncated_payload, ps_key, ps_text, ps_extracted)
+                    prompt_tokens = count_tokens(system_prompt, model_choice) + count_tokens(prompt, model_choice)
+                    if prompt_tokens > max_input:
+                        llm_result = error_result("PROMPT_EXCEEDS_CONTEXT")
+                    else:
+                        llm_result = safe_call_openai(
+                            prompt,
+                            openai_api_key,
+                            anthropic_api_key,
+                            model_choice,
+                        )
 
-        status_box.success("Batch evaluation complete.")
-        if failed_count:
-            st.warning(f"{failed_count} submission(s) failed to evaluate — retry them individually.")
+                eval_status = "FAILED" if "EVALUATION_FAILED" in llm_result.get("red_flags", []) else "SUCCESS"
+                if eval_status == "FAILED":
+                    result_row = build_result_row(
+                        sid,
+                        submission,
+                        llm_result,
+                        None,
+                        "EVAL_FAILED",
+                        "FAILED",
+                        media_score,
+                        proto_score,
+                        None,
+                        None,
+                        visual_score,
+                    )
+                else:
+                    scores = compute_final_score(
+                        submission["media_rating"],
+                        submission["proto_rating"],
+                        llm_result["ppt_score_raw"],
+                        llm_result["alignment_score_raw"],
+                        submission.get("visual_rating", 0),
+                    )
+                    verdict = "IN" if scores["total"] >= IN_THRESHOLD else "OUT"
+                    result_row = build_result_row(
+                        sid,
+                        submission,
+                        llm_result,
+                        scores["total"],
+                        verdict,
+                        "SUCCESS",
+                        scores["media_score"],
+                        scores["proto_score"],
+                        scores["ppt_score"],
+                        scores["align_score"],
+                        scores["visual_score"],
+                    )
+
+            submission["llm_result"] = llm_result
+            submission["last_result_row"] = result_row
+            st.session_state.results.append(result_row)
+
+            if result_row["Eval Status"] == "SUCCESS" and result_row["VERDICT"] == "IN":
+                insert_selected(
+                    {
+                        "submission_hash": submission.get("submission_hash", ""),
+                        "team_name": submission.get("team_name", ""),
+                        "file_name": submission.get("file_name", ""),
+                        "domain": submission.get("domain", ""),
+                        "problem_stmt": submission.get("ps_key", ""),
+                        "media_score": result_row["Media Score"],
+                        "proto_score": result_row["Prototype Score"],
+                        "ppt_score": result_row["PPT Score"],
+                        "align_score": result_row["Alignment Score"],
+                        "visual_score": result_row["Visual Score"],
+                        "total_score": result_row["TOTAL"],
+                        "ppt_verdict": result_row["PPT Verdict"],
+                        "align_verdict": result_row["Alignment Verdict"],
+                        "red_flags": result_row["Red Flags"],
+                    }
+                )
+
+            insert_audit_log(result_row)
+            if result_row["VERDICT"] == "EVAL_FAILED":
+                failed_count += 1
+        except Exception as exc:  # noqa: BLE001
+            failed_count += 1
+            llm_result = error_result(str(exc))
+            result_row = build_result_row(
+                sid,
+                submission,
+                llm_result,
+                None,
+                "EVAL_FAILED",
+                "FAILED",
+                MEDIA_SCORE_MAP.get(submission.get("media_rating", 0), 0.0),
+                PROTO_SCORE_MAP.get(submission.get("proto_rating", 0), 0.0),
+                None,
+                None,
+                VISUAL_BONUS_MAP.get(submission.get("visual_rating", 0), 0.0),
+            )
+            submission["llm_result"] = llm_result
+            submission["last_result_row"] = result_row
+            st.session_state.results.append(result_row)
+            insert_audit_log(result_row)
+
+        progress.progress(index / len(items), text=f"Completed {index}/{len(items)}")
+
+    status_box.success("Batch evaluation complete.")
+    if failed_count:
+        st.warning(f"{failed_count} submission(s) failed to evaluate — retry them individually.")
 
 if st.session_state.results:
     st.header("Step 4 · Results", divider="gray")
