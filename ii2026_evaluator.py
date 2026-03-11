@@ -14,6 +14,7 @@ Otherwise, total is capped at 1.00. IN threshold is 0.60.
 from __future__ import annotations
 
 import difflib
+import html
 import hashlib
 import hmac
 import importlib.util
@@ -32,7 +33,7 @@ from base64 import b64encode
 from io import BytesIO
 from pathlib import Path
 from typing import Any, cast
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 AUTO_INSTALL_PACKAGES = [
     ("streamlit", "streamlit"),
@@ -97,6 +98,7 @@ LINK_TIMEOUT_SECONDS = 30
 MAX_DOWNLOAD_MB = 50
 PRESENTATION_CONVERSION_TIMEOUT_SECONDS = 120
 SOFFICE_CANDIDATES = ["soffice", "soffice.com", "libreoffice"]
+URL_PATTERN = re.compile(r"https?://[^\s<>'\")]+", re.IGNORECASE)
 CSV_URL_COLUMN = "Q1: Upload your presentation."
 CSV_TEAM_COLUMN = "Team Name"
 CSV_DOMAIN_COLUMN = "Domain"
@@ -1444,9 +1446,24 @@ def extract_pptx_text(file_bytes: bytes) -> dict[str, str]:
             if text_frame is None:
                 continue
             for paragraph in text_frame.paragraphs:
-                text = paragraph.text.strip()
+                paragraph_parts: list[str] = []
+                paragraph_links: list[str] = []
+                for run in paragraph.runs:
+                    run_text = run.text.strip()
+                    if run_text:
+                        paragraph_parts.append(run_text)
+                    hyperlink = getattr(getattr(run, "hyperlink", None), "address", None)
+                    if hyperlink:
+                        link = str(hyperlink).strip()
+                        if link and link not in paragraph_links:
+                            paragraph_links.append(link)
+
+                text = " ".join(part for part in paragraph_parts if part).strip() or paragraph.text.strip()
                 if text:
                     parts.append(text)
+                for link in paragraph_links:
+                    if link not in parts:
+                        parts.append(link)
         label = SLIDE_LABELS[idx] if idx < len(SLIDE_LABELS) else f"SLIDE_{idx + 1}"
         result[label] = sanitize_unicode(normalize_whitespace("\n".join(parts))) if parts else "<NO TEXT ON SLIDE>"
     if not result:
@@ -2246,6 +2263,84 @@ def get_browser_open_pdf_bytes(submission: dict[str, Any]) -> bytes | None:
     return None
 
 
+def build_html_slide_preview_url(submission: dict[str, Any]) -> str:
+    def _render_text_with_links(text: str) -> str:
+        escaped = html.escape(text)
+        rendered_parts: list[str] = []
+        last_index = 0
+        for match in URL_PATTERN.finditer(text):
+            start, end = match.span()
+            rendered_parts.append(html.escape(text[last_index:start]))
+            url = match.group(0)
+            safe_url = html.escape(url, quote=True)
+            rendered_parts.append(f'<a href="{safe_url}" target="_blank" rel="noopener noreferrer">{html.escape(url)}</a>')
+            last_index = end
+        rendered_parts.append(html.escape(text[last_index:]))
+        return "".join(rendered_parts).replace("\n", "<br>")
+
+    file_name = html.escape(str(submission.get("file_name", "") or "Submission"))
+    slides = submission.get("slides", []) or []
+    rendered_slides: list[str] = []
+    discovered_links: list[str] = []
+
+    for source_key in ("submission_url", "media_link", "prototype_link", "github_link"):
+        source_value = str(submission.get(source_key, "") or "").strip()
+        if source_value and source_value not in discovered_links:
+            discovered_links.append(source_value)
+
+    for slide in slides:
+        slide_label = html.escape(str(slide.get("label", "Slide")))
+        slide_text_raw = str(slide.get("text", "") or "<NO TEXT>")
+        for match in URL_PATTERN.findall(slide_text_raw):
+            if match not in discovered_links:
+                discovered_links.append(match)
+        slide_text = _render_text_with_links(slide_text_raw)
+        rendered_slides.append(
+            "".join(
+                [
+                    '<section class="slide">',
+                    f"<h2>{slide_label}</h2>",
+                    f"<div class='slide-text'>{slide_text}</div>",
+                    "</section>",
+                ]
+            )
+        )
+
+    if not rendered_slides:
+        rendered_slides.append('<section class="slide"><h2>No preview available</h2><div class="slide-text">No extracted slide text was found.</div></section>')
+
+    links_html = ""
+    if discovered_links:
+        link_items = "".join(
+            f'<li><a href="{html.escape(link, quote=True)}" target="_blank" rel="noopener noreferrer">{html.escape(link)}</a></li>'
+            for link in discovered_links
+        )
+        links_html = f'<section class="slide"><h2>Links found</h2><ul>{link_items}</ul></section>'
+
+    html_doc = "".join(
+        [
+            "<!doctype html><html><head><meta charset='utf-8'>",
+            f"<title>{file_name} preview</title>",
+            "<style>",
+            "body{font-family:Arial,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:24px;}",
+            ".wrap{max-width:1100px;margin:0 auto;}",
+            ".note{margin-bottom:16px;color:#cbd5e1;}",
+            ".slide{background:#111827;border:1px solid #334155;border-radius:12px;padding:18px;margin:0 0 18px 0;}",
+            "h1,h2{margin:0 0 12px 0;}",
+            ".slide-text{white-space:normal;word-break:break-word;line-height:1.5;}",
+            "ul{margin:0;padding-left:20px;} li{margin:6px 0;}",
+            "a{color:#93c5fd;}",
+            "</style></head><body><div class='wrap'>",
+            f"<h1>{file_name}</h1>",
+            "<p class='note'>Cheap preview generated from extracted slide text. Layout, images, and styling are not preserved, but detected links are listed below.</p>",
+            links_html,
+            *rendered_slides,
+            "</div></body></html>",
+        ]
+    )
+    return f"data:text/html;charset=utf-8,{quote(html_doc)}"
+
+
 def build_browser_open_url(submission: dict[str, Any]) -> str | None:
     submission_url = str(submission.get("submission_url", "") or "").strip()
     file_name = str(submission.get("file_name", "") or "")
@@ -2253,8 +2348,14 @@ def build_browser_open_url(submission: dict[str, Any]) -> str | None:
     if submission_url and file_ext == ".pdf":
         return submission_url
 
-    pdf_bytes = get_browser_open_pdf_bytes(submission)
+    try:
+        pdf_bytes = get_browser_open_pdf_bytes(submission)
+    except ValueError:
+        pdf_bytes = None
+
     if not pdf_bytes:
+        if file_ext in PRESENTATION_EXTENSIONS:
+            return build_html_slide_preview_url(submission)
         return None
 
     encoded_pdf = b64encode(pdf_bytes).decode("ascii")
@@ -2287,8 +2388,12 @@ def render_open_in_browser_link(submission: dict[str, Any], sid: str) -> None:
     try:
         open_url = build_browser_open_url(submission)
     except ValueError as exc:
-        st.caption(str(exc))
-        return
+        if file_ext in PRESENTATION_EXTENSIONS:
+            st.caption(f"Falling back to text-only preview: {exc}")
+            open_url = build_html_slide_preview_url(submission)
+        else:
+            st.caption(str(exc))
+            return
 
     if not open_url:
         st.caption("Browser preview is available for PDFs and converted presentations.")
