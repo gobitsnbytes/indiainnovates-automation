@@ -20,6 +20,17 @@ sudo apt update
 sudo apt install -y nginx certbot python3-certbot-nginx
 ```
 
+## Step 1.5: Install evaluator system dependencies
+
+These packages are needed for:
+- OCR fallback on image-based PDFs
+- PPT/PPTX browser preview conversion
+
+```bash
+sudo apt update
+sudo apt install -y poppler-utils tesseract-ocr libreoffice-impress
+```
+
 ## Step 2: Set Up Application
 
 ```bash
@@ -32,6 +43,13 @@ REPO_DIR="$(pwd -P)"
 # Activate virtual environment and install dependencies
 source .venv/bin/activate  # or: source venv/bin/activate
 pip install -r requirements.txt
+```
+
+Optional environment settings:
+
+```bash
+# Increase/decrease the in-app processing limit (default: 50MB)
+export II2026_MAX_UPLOAD_MB=50
 ```
 
 If your repo is not in `/root/indiainnovates-automation`, use that real path everywhere below.
@@ -168,6 +186,17 @@ sudo netstat -tlnp | grep 850
 cd "$REPO_DIR"
 source "$REPO_DIR"/.venv/bin/activate
 streamlit run "$REPO_DIR"/ii2026_evaluator.py --server.port=8501
+```
+
+### If OCR or PPT/PPTX browser preview fails:
+```bash
+# Verify required binaries are installed
+which pdftoppm
+which tesseract
+which soffice
+
+# Reinstall if needed
+sudo apt install -y poppler-utils tesseract-ocr libreoffice-impress
 ```
 
 ### If Nginx returns 502 Bad Gateway:

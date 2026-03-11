@@ -85,7 +85,7 @@ DATABASE_URL_ENV_VAR = "DATABASE_URL"
 SUBMISSION_CSV_ENV_VAR = "II2026_SUBMISSIONS_CSV"
 SECRET_QUEUE_CODE = "aero"
 
-MAX_UPLOAD_MB = 20
+MAX_UPLOAD_MB = max(20, int(os.environ.get("II2026_MAX_UPLOAD_MB", "50")))
 PDF_COMPRESS_HELP_URL = "https://www.ilovepdf.com/compress_pdf"
 MIN_TEXT_CHARS = 80
 RESERVED_OUTPUT_TOKENS = 512
@@ -109,6 +109,19 @@ DEFAULT_SUBMISSION_CSV_CANDIDATES = [
     BASE_DIR / "submissions.csv",
     BASE_DIR / "Copy of 3751_29473135_download_submission_1394436 - 3751_29473135_download_submission_1394436.csv.csv",
 ]
+
+
+def get_ocr_dependency_hint(component: str) -> str:
+    if os.name == "nt":
+        if component == "poppler":
+            return "OCR unavailable — install Poppler for Windows or use a text-based PDF/PPTX."
+        if component == "tesseract":
+            return "OCR unavailable — install Tesseract OCR for Windows or use a text-based PDF/PPTX."
+    if component == "poppler":
+        return "OCR unavailable — run: apt-get install poppler-utils"
+    if component == "tesseract":
+        return "OCR unavailable — run: apt-get install tesseract-ocr"
+    return "OCR unavailable."
 
 # ── Provider routing ──────────────────────────────────────
 OPENAI_MODELS = {
@@ -1526,12 +1539,12 @@ def extract_ppt_text(file_bytes: bytes) -> dict[str, str]:
                 import pdf2image
                 from pdf2image.exceptions import PDFInfoNotInstalledError, PDFPageCountError, PDFSyntaxError
             except ImportError as exc:
-                raise ValueError("OCR unavailable — run: apt-get install poppler-utils") from exc
+                raise ValueError(get_ocr_dependency_hint("poppler")) from exc
 
             try:
                 import pytesseract
             except ImportError as exc:
-                raise ValueError("OCR unavailable — run: apt-get install tesseract-ocr") from exc
+                raise ValueError(get_ocr_dependency_hint("tesseract")) from exc
 
             try:
                 from PIL import Image
@@ -1542,7 +1555,7 @@ def extract_ppt_text(file_bytes: bytes) -> dict[str, str]:
             try:
                 images = pdf2image.convert_from_bytes(file_bytes, dpi=200)
             except (PDFInfoNotInstalledError, PDFPageCountError, PDFSyntaxError) as exc:
-                raise ValueError("OCR unavailable — run: apt-get install poppler-utils") from exc
+                raise ValueError(get_ocr_dependency_hint("poppler")) from exc
 
             for img in images:
                 if not isinstance(img, Image.Image):
@@ -1550,7 +1563,7 @@ def extract_ppt_text(file_bytes: bytes) -> dict[str, str]:
                 try:
                     text = pytesseract.image_to_string(img, lang="eng").strip()
                 except pytesseract.TesseractNotFoundError as exc:
-                    raise ValueError("OCR unavailable — run: apt-get install tesseract-ocr") from exc
+                    raise ValueError(get_ocr_dependency_hint("tesseract")) from exc
                 raw_pages.append(normalize_whitespace(text))
         except Exception as exc:
             raise ValueError(f"All extraction methods failed — {exc}") from exc
@@ -2501,8 +2514,8 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True,
 )
 st.info(
-    f"If a PDF is larger than {MAX_UPLOAD_MB}MB, compress it first using "
-    f"[iLovePDF]({PDF_COMPRESS_HELP_URL}), then upload the compressed file."
+    f"Files up to {MAX_UPLOAD_MB}MB are processed directly. If a PDF is larger, compress it first using "
+    f"[iLovePDF]({PDF_COMPRESS_HELP_URL}) and upload the compressed file."
 )
 
 # ── URL download section ─────────────────────────────────────────────
@@ -2535,9 +2548,14 @@ if _url_btn and _url_input:
         except ValueError as exc:
             st.error(str(exc))
 
+active_url_downloads = {
+    sid: entry
+    for sid, entry in st.session_state.url_downloads.items()
+    if sid not in st.session_state.failed_uploads
+}
 current_batch_urls = {
     str(entry.get("submission_url", "") or "").strip()
-    for entry in st.session_state.url_downloads.values()
+    for entry in active_url_downloads.values()
     if entry.get("submission_url")
 }
 
@@ -2546,7 +2564,8 @@ if st.session_state.get("server_queue_unlocked"):
     st.caption("Shows pending CSV submissions only. Already evaluated links and duplicate CSV rows stay hidden.")
     try:
         pending_csv_rows, pending_csv_stats, pending_csv_path = load_pending_csv_submissions(current_batch_urls)
-        batch_slots_left = max(0, MAX_FILES_BATCH - (len(uploaded_files) if uploaded_files else 0) - len(st.session_state.url_downloads))
+        active_batch_count = (len(uploaded_files) if uploaded_files else 0) + len(active_url_downloads)
+        batch_slots_left = max(0, MAX_FILES_BATCH - active_batch_count)
         next_load_count = min(10, batch_slots_left, len(pending_csv_rows))
 
         stat_col_1, stat_col_2, stat_col_3, stat_col_4 = st.columns(4)
@@ -2594,7 +2613,7 @@ if not has_any:
     st.markdown(
         """
 1. Upload PDF / PPTX submissions (or paste a download URL above).
-2. If a PDF is larger than 20MB, compress it with [iLovePDF](https://www.ilovepdf.com/compress_pdf) and upload it again.
+2. If a file is larger than the {MAX_UPLOAD_MB}MB processing limit, compress it with [iLovePDF](https://www.ilovepdf.com/compress_pdf) and upload it again.
 3. Confirm team, domain, and problem statement.
 4. Add human-reviewed media / prototype / GitHub inputs.
 5. Run evaluation.

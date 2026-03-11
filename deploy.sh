@@ -27,6 +27,13 @@ git fetch --prune origin
 git checkout "$DEPLOY_BRANCH"
 git reset --hard "origin/$DEPLOY_BRANCH"
 
+echo "==> Installing system packages"
+sudo apt-get update
+sudo apt-get install -y \
+  poppler-utils \
+  tesseract-ocr \
+  libreoffice-impress
+
 echo "==> Ensuring virtual environment"
 if [[ ! -d "$VENV_DIR" ]]; then
   "$PYTHON_BIN" -m venv "$VENV_DIR"
