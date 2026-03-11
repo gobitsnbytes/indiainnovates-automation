@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+DEPLOY_PATH="${DEPLOY_PATH:-/opt/indiainnovates-automation}"
+DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
+SYSTEMD_SERVICE="${SYSTEMD_SERVICE:-indiainnovates-automation}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+VENV_DIR="${VENV_DIR:-.venv}"
+REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-requirements.txt}"
+
+if [[ ! -d "$DEPLOY_PATH/.git" ]]; then
+  echo "Repository not found at $DEPLOY_PATH" >&2
+  exit 1
+fi
+
+cd "$DEPLOY_PATH"
+
+if [[ "$VENV_DIR" == ".venv" && ! -d "$VENV_DIR" && -d "venv" ]]; then
+  VENV_DIR="venv"
+fi
+
+echo "==> Syncing branch $DEPLOY_BRANCH"
+git fetch --prune origin
+git checkout "$DEPLOY_BRANCH"
+git reset --hard "origin/$DEPLOY_BRANCH"
+
+echo "==> Ensuring virtual environment"
+if [[ ! -d "$VENV_DIR" ]]; then
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
+fi
+
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
+
+python -m pip install --upgrade pip
+
+if [[ -f "$REQUIREMENTS_FILE" ]]; then
+  echo "==> Installing Python dependencies"
+  python -m pip install -r "$REQUIREMENTS_FILE"
+fi
+
+echo "==> Restarting service $SYSTEMD_SERVICE"
+sudo systemctl restart "$SYSTEMD_SERVICE"
+sudo systemctl is-active --quiet "$SYSTEMD_SERVICE"
+
+echo "==> Deploy complete"

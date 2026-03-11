@@ -1,0 +1,11 @@
+streamlit
+pandas
+tiktoken
+openai
+python-pptx
+pypdf>=4.0
+pdfplumber
+Pillow
+pytesseract
+pdf2image
+pyzipper

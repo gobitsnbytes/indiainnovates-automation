@@ -1,0 +1,43 @@
+name: Deploy to Droplet
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Start SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.DROPLET_SSH_KEY }}
+
+      - name: Add droplet to known hosts
+        env:
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "$DROPLET_HOST" >> ~/.ssh/known_hosts
+
+      - name: Sync repo and deploy
+        env:
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_USER: ${{ secrets.DROPLET_USER }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          SYSTEMD_SERVICE: ${{ secrets.SYSTEMD_SERVICE }}
+          DEPLOY_BRANCH: ${{ github.ref_name }}
+        run: |
+          ssh "$DROPLET_USER@$DROPLET_HOST" \
+            "export DEPLOY_PATH='$DEPLOY_PATH' SYSTEMD_SERVICE='$SYSTEMD_SERVICE' DEPLOY_BRANCH='$DEPLOY_BRANCH'; \
+            if [ ! -d \"$DEPLOY_PATH/.git\" ]; then echo 'Repo not found at' \"$DEPLOY_PATH\"; exit 1; fi; \
+            git -C \"$DEPLOY_PATH\" fetch --prune origin; \
+            git -C \"$DEPLOY_PATH\" checkout \"$DEPLOY_BRANCH\"; \
+            git -C \"$DEPLOY_PATH\" reset --hard \"origin/$DEPLOY_BRANCH\"; \
+            bash \"$DEPLOY_PATH/deploy.sh\""

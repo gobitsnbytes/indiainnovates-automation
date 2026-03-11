@@ -523,7 +523,7 @@ def insert_selected(row: dict[str, Any]) -> None:
         connection = get_db_connection()
         connection.execute(
             """
-            INSERT OR IGNORE INTO selected (
+            INSERT INTO selected (
                 submission_hash,
                 team_name,
                 file_name,
@@ -539,6 +539,20 @@ def insert_selected(row: dict[str, Any]) -> None:
                 align_verdict,
                 red_flags
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(submission_hash) DO UPDATE SET
+                team_name = excluded.team_name,
+                file_name = excluded.file_name,
+                domain = excluded.domain,
+                problem_stmt = excluded.problem_stmt,
+                media_score = excluded.media_score,
+                proto_score = excluded.proto_score,
+                ppt_score = excluded.ppt_score,
+                align_score = excluded.align_score,
+                visual_score = excluded.visual_score,
+                total_score = excluded.total_score,
+                ppt_verdict = excluded.ppt_verdict,
+                align_verdict = excluded.align_verdict,
+                red_flags = excluded.red_flags
             """,
             (
                 row.get("submission_hash", ""),
@@ -563,6 +577,102 @@ def insert_selected(row: dict[str, Any]) -> None:
     finally:
         if connection is not None:
             connection.close()
+
+
+def delete_selected(submission_hash: str) -> None:
+    if not submission_hash:
+        return
+
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = get_db_connection()
+        connection.execute("DELETE FROM selected WHERE submission_hash = ?", (submission_hash,))
+        connection.commit()
+    except sqlite3.OperationalError as exc:
+        st.error(f"Failed to update selected participant store: {exc}")
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def get_latest_evaluation(submission_hash: str) -> dict[str, Any] | None:
+    if not submission_hash:
+        return None
+
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = get_db_connection()
+        row = connection.execute(
+            """
+            SELECT
+                evaluated_at,
+                attempt_no,
+                submission_hash,
+                team_name,
+                file_name,
+                domain,
+                problem_stmt,
+                media_score,
+                proto_score,
+                ppt_score,
+                align_score,
+                visual_score,
+                total_score,
+                verdict,
+                eval_status,
+                ppt_verdict,
+                align_verdict,
+                red_flags,
+                model,
+                submission_url
+            FROM audit_log
+            WHERE submission_hash = ?
+            ORDER BY attempt_no DESC, id DESC
+            LIMIT 1
+            """,
+            (submission_hash,),
+        ).fetchone()
+        return dict(row) if row is not None else None
+    except sqlite3.OperationalError as exc:
+        st.error(f"Failed to read previous evaluation: {exc}")
+        return None
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def build_existing_result_row(sid: str, submission: dict[str, Any], prior_eval: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "Submission ID": sid,
+        "Submission Hash": submission.get("submission_hash", prior_eval.get("submission_hash", "")),
+        "Submission URL": submission.get("submission_url", prior_eval.get("submission_url", "")),
+        "File": submission.get("file_name", prior_eval.get("file_name", "")),
+        "Team": submission.get("team_name", prior_eval.get("team_name", "")),
+        "Domain": prior_eval.get("domain", submission.get("domain", "")),
+        "Problem Statement": prior_eval.get("problem_stmt", submission.get("ps_key", "")),
+        "Media Link": submission.get("media_link", ""),
+        "Prototype Link": submission.get("prototype_link", ""),
+        "GitHub Link": submission.get("github_link", ""),
+        "Media Raw": None,
+        "Media Score": prior_eval.get("media_score"),
+        "Prototype Raw": None,
+        "Prototype Score": prior_eval.get("proto_score"),
+        "Visual Raw": None,
+        "Visual Score": prior_eval.get("visual_score"),
+        "PPT Raw": None,
+        "PPT Score": prior_eval.get("ppt_score"),
+        "Alignment Raw": None,
+        "Alignment Score": prior_eval.get("align_score"),
+        "TOTAL": prior_eval.get("total_score"),
+        "VERDICT": prior_eval.get("verdict", ""),
+        "Eval Status": prior_eval.get("eval_status", ""),
+        "Present Required Slides": " | ".join(submission.get("present_required", [])),
+        "Missing Required Slides": " | ".join(submission.get("missing_required", [])),
+        "PPT Verdict": prior_eval.get("ppt_verdict", ""),
+        "Alignment Verdict": prior_eval.get("align_verdict", ""),
+        "Red Flags": prior_eval.get("red_flags", ""),
+        "Model": prior_eval.get("model", ""),
+    }
 
 
 def insert_audit_log(row: dict[str, Any]) -> None:
@@ -1311,6 +1421,7 @@ def ensure_submission_defaults(
     extracted_map = extract_submission(file_bytes, file_name)
     slide_entries, slide_map = build_slide_entries(extracted_map)
     extracted_ps = extract_problem_statement_text(slide_map)
+    previous_eval = get_latest_evaluation(submission_hash_value)
     team_name = try_extract_team_name(slide_map)
     default_domain = ALL_DOMAINS[0]
     default_ps_key = list(PROBLEM_STATEMENTS[default_domain].keys())[0]
@@ -1333,6 +1444,8 @@ def ensure_submission_defaults(
         "slide_map": slide_map,
         "slides": slide_entries,
         "extracted_ps": extracted_ps,
+        "previous_eval": previous_eval,
+        "reeval_requested": False,
         "ppt_payload": None,
         "present_required": [],
         "missing_required": [],
@@ -1344,6 +1457,8 @@ def ensure_submission_defaults(
 
     if existing is None:
         base["ppt_payload"], base["present_required"], base["missing_required"] = build_llm_ppt_payload(slide_map)
+        if previous_eval is not None:
+            base["last_result_row"] = build_existing_result_row(sid, base, previous_eval)
         return base
 
     merged = {**base, **existing}
@@ -1354,9 +1469,12 @@ def ensure_submission_defaults(
     merged["slide_map"] = slide_map
     merged["slides"] = slide_entries
     merged["extracted_ps"] = extracted_ps
+    merged["previous_eval"] = previous_eval
     if not merged.get("team_name") or merged["team_name"] == "Unknown Team":
         merged["team_name"] = team_name
     merged["ppt_payload"], merged["present_required"], merged["missing_required"] = build_llm_ppt_payload(slide_map)
+    if previous_eval is not None and not merged.get("llm_result"):
+        merged["last_result_row"] = build_existing_result_row(sid, merged, previous_eval)
     return merged
 
 
@@ -1663,6 +1781,29 @@ for entry in uploaded_entries:
         continue
 
     with st.expander(f"{file_name} · Team: {submission['team_name']}", expanded=True):
+        previous_eval = submission.get("previous_eval")
+        if previous_eval:
+            previous_total = format_score(previous_eval.get("total_score"))
+            previous_verdict = previous_eval.get("verdict", "—")
+            previous_when = previous_eval.get("evaluated_at", "")
+            previous_attempt = previous_eval.get("attempt_no", "—")
+            st.warning(
+                f"This project has already been evaluated. Previous total: {previous_total} · "
+                f"Verdict: {previous_verdict} · Attempt: {previous_attempt} · Time: {previous_when}"
+            )
+            st.caption(
+                f"Previous model: {previous_eval.get('model', '—')} · "
+                f"PPT {format_score(previous_eval.get('ppt_score'))} · "
+                f"Alignment {format_score(previous_eval.get('align_score'))}"
+            )
+            submission["reeval_requested"] = st.checkbox(
+                "Re-evaluate this submission",
+                value=submission.get("reeval_requested", False),
+                key=f"reeval_{sid}",
+            )
+            if not submission.get("reeval_requested", False):
+                st.caption("Default behavior: skip duplicate evaluation and keep the previous result.")
+
         submission["team_name"] = st.text_input(
             "Team name",
             value=submission["team_name"],
@@ -1809,6 +1950,7 @@ if trigger:
     progress = st.progress(0, text="Preparing evaluations...")
     status_box = st.empty()
     failed_count = 0
+    duplicate_skip_count = 0
 
     items = uploaded_entries
     for index, entry in enumerate(items, start=1):
@@ -1827,6 +1969,12 @@ if trigger:
 
         status_box.info(f"Evaluating {index}/{len(items)}: {file_name}")
         submission["model"] = model_choice
+
+        if submission.get("previous_eval") and not submission.get("reeval_requested", False):
+            duplicate_skip_count += 1
+            status_box.warning(f"Skipping {file_name}: already evaluated earlier. Tick re-evaluate to run again.")
+            progress.progress(index / len(items), text=f"Completed {index}/{len(items)}")
+            continue
 
         try:
             domain = submission["domain"]
@@ -1950,8 +2098,11 @@ if trigger:
                         "red_flags": result_row["Red Flags"],
                     }
                 )
+            elif result_row["Eval Status"] == "SUCCESS":
+                delete_selected(submission.get("submission_hash", ""))
 
             insert_audit_log(result_row)
+            submission["previous_eval"] = get_latest_evaluation(submission.get("submission_hash", ""))
             if result_row["VERDICT"] == "EVAL_FAILED":
                 failed_count += 1
         except Exception as exc:  # noqa: BLE001
@@ -1974,12 +2125,18 @@ if trigger:
             submission["last_result_row"] = result_row
             st.session_state.results.append(result_row)
             insert_audit_log(result_row)
+            submission["previous_eval"] = get_latest_evaluation(submission.get("submission_hash", ""))
 
         progress.progress(index / len(items), text=f"Completed {index}/{len(items)}")
 
     status_box.success("Batch evaluation complete.")
     if failed_count:
         st.warning(f"{failed_count} submission(s) failed to evaluate — retry them individually.")
+    if duplicate_skip_count:
+        st.info(
+            f"{duplicate_skip_count} submission(s) were already evaluated and were skipped. "
+            "Use the re-evaluate checkbox on a submission to run a fresh attempt."
+        )
 
 if st.session_state.results:
     st.header("Step 4 · Results", divider="gray")
