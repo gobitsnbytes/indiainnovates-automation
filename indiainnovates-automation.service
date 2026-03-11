@@ -5,9 +5,9 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/indiainnovates-automation
-Environment="PATH=/opt/indiainnovates-automation/.venv/bin"
-ExecStart=/opt/indiainnovates-automation/.venv/bin/streamlit run ii2026_evaluator.py \
+WorkingDirectory=/root/indiainnovates-automation
+Environment="PATH=/root/indiainnovates-automation/venv/bin"
+ExecStart=/root/indiainnovates-automation/venv/bin/streamlit run ii2026_evaluator.py \
     --server.port=850%i \
     --server.address=127.0.0.1 \
     --server.headless=true \

@@ -1,5 +1,6 @@
 streamlit
 pandas
+psycopg[binary]>=3.1
 tiktoken
 openai
 python-pptx
@@ -8,4 +9,3 @@ pdfplumber
 Pillow
 pytesseract
 pdf2image
-pyzipper

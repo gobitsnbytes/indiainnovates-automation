@@ -19,7 +19,6 @@ import importlib.util
 import json
 import os
 import re
-import sqlite3
 import subprocess
 import sys
 import time
@@ -34,6 +33,7 @@ from urllib.parse import urlparse
 AUTO_INSTALL_PACKAGES = [
     ("streamlit", "streamlit"),
     ("pandas", "pandas"),
+    ("psycopg", "psycopg[binary]"),
     ("tiktoken", "tiktoken"),
     ("openai", "openai"),
     ("pptx", "python-pptx"),
@@ -42,7 +42,6 @@ AUTO_INSTALL_PACKAGES = [
     ("PIL", "Pillow"),
     ("pytesseract", "pytesseract"),
     ("pdf2image", "pdf2image"),
-    ("pyzipper", "pyzipper"),
 ]
 
 
@@ -65,38 +64,31 @@ ensure_python_packages()
 
 import openai
 import pandas as pd
+import psycopg
 import streamlit as st
 import tiktoken
 from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
 from pptx import Presentation
+from psycopg.rows import dict_row
 
 IN_THRESHOLD = 0.60
 MAX_PPT_TOKENS = 3000
 LLM_CONTEXT_SOFT_LIMIT = 7000
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "selected.db"
 ENV_PATH = BASE_DIR / ".env"
+DATABASE_URL_ENV_VAR = "DATABASE_URL"
 
 MAX_UPLOAD_MB = 20
 MIN_TEXT_CHARS = 80
 RESERVED_OUTPUT_TOKENS = 512
 SAFETY_MARGIN_TOKENS = 500
 MAX_EXTRACTED_CHARS = 200_000
-DB_DOWNLOAD_PASSWORD = b"yash<3akshat"
 INJECTION_PATTERNS = ["ignore", "disregard", "system:", "assistant:", "[inst]", "###"]
 SUPPORTED_EXTENSIONS = {".pdf", ".pptx", ".ppt"}
 LINK_TIMEOUT_SECONDS = 30
 MAX_DOWNLOAD_MB = 50
 
 # ── Provider routing ──────────────────────────────────────
-ANTHROPIC_BASE_URL = "https://api.anthropic.com/v1/"
-
-ANTHROPIC_MODELS = {
-    "claude-sonnet-4-5",
-    "claude-sonnet-4-6",
-    "claude-haiku-4-5-20251001",
-}
-
 OPENAI_MODELS = {
     "gpt-5-mini",
     "gpt-4.1-mini",
@@ -111,14 +103,8 @@ MODEL_CONTEXT_WINDOWS = {
     "gpt-4.1-mini": 1_000_000,
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
-    "claude-sonnet-4-5": 200_000,
-    "claude-sonnet-4-6": 200_000,
-    "claude-haiku-4-5-20251001": 200_000,
 }
 MODEL_OPTIONS = [
-    "claude-sonnet-4-6",
-    "claude-sonnet-4-5",
-    "claude-haiku-4-5-20251001",
     "gpt-5-mini",
     "gpt-4.1-mini",
     "gpt-4.1",
@@ -357,121 +343,66 @@ def submission_id(file_bytes: bytes, file_name: str) -> str:
     return full_submission_hash(file_bytes, file_name)[:16]
 
 
-def get_db_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(DB_PATH, timeout=30)
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA busy_timeout=30000")
-    connection.row_factory = sqlite3.Row
-    return connection
+def get_database_url() -> str:
+    return os.environ.get(DATABASE_URL_ENV_VAR, "").strip()
 
 
-def create_selected_table(connection: sqlite3.Connection) -> None:
+def get_db_connection() -> Any:
+    database_url = get_database_url()
+    if not database_url:
+        raise ValueError(
+            "DATABASE_URL is not configured. Add it to the server environment or local .env file."
+        )
+
+    return psycopg.connect(database_url, row_factory=dict_row)
+
+
+def create_selected_table(connection: Any) -> None:
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS selected (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            inserted_at     TEXT    DEFAULT (datetime('now','localtime')),
-            submission_hash TEXT    UNIQUE,
+            id              BIGSERIAL PRIMARY KEY,
+            inserted_at     TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+            submission_hash TEXT UNIQUE,
             team_name       TEXT,
             file_name       TEXT,
             domain          TEXT,
             problem_stmt    TEXT,
-            media_score     REAL,
-            proto_score     REAL,
-            ppt_score       REAL,
-            align_score     REAL,
-            visual_score    REAL,
-            total_score     REAL,
+            media_score     DOUBLE PRECISION,
+            proto_score     DOUBLE PRECISION,
+            ppt_score       DOUBLE PRECISION,
+            align_score     DOUBLE PRECISION,
+            visual_score    DOUBLE PRECISION,
+            total_score     DOUBLE PRECISION,
             ppt_verdict     TEXT,
             align_verdict   TEXT,
             red_flags       TEXT
         )
         """
     )
-
-
-def selected_table_needs_migration(connection: sqlite3.Connection) -> bool:
-    columns = {row["name"] for row in connection.execute("PRAGMA table_info(selected)").fetchall()}
-    if "submission_hash" not in columns or "visual_score" not in columns:
-        return True
-
-    for index_row in connection.execute("PRAGMA index_list(selected)").fetchall():
-        if not index_row["unique"]:
-            continue
-        index_name = index_row["name"]
-        escaped_index_name = index_name.replace('"', '""')
-        index_columns = [
-            info_row["name"]
-            for info_row in connection.execute(f'PRAGMA index_info("{escaped_index_name}")').fetchall()
-        ]
-        if index_columns == ["file_name"]:
-            return True
-
-    return False
-
-
-def migrate_selected_table(connection: sqlite3.Connection) -> None:
-    connection.execute("ALTER TABLE selected RENAME TO selected_legacy")
-    create_selected_table(connection)
     connection.execute(
-        """
-        INSERT INTO selected (
-            submission_hash,
-            team_name,
-            file_name,
-            domain,
-            problem_stmt,
-            media_score,
-            proto_score,
-            ppt_score,
-            align_score,
-            visual_score,
-            total_score,
-            ppt_verdict,
-            align_verdict,
-            red_flags,
-            inserted_at
-        )
-        SELECT
-            NULL,
-            team_name,
-            file_name,
-            domain,
-            problem_stmt,
-            media_score,
-            proto_score,
-            ppt_score,
-            align_score,
-            0.0,
-            total_score,
-            ppt_verdict,
-            align_verdict,
-            red_flags,
-            inserted_at
-        FROM selected_legacy
-        """
+        "CREATE INDEX IF NOT EXISTS idx_selected_total_score ON selected (total_score DESC)"
     )
-    connection.execute("DROP TABLE selected_legacy")
 
 
-def ensure_audit_log_table(connection: sqlite3.Connection) -> None:
+def ensure_audit_log_table(connection: Any) -> None:
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS audit_log (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            evaluated_at    TEXT    DEFAULT (datetime('now','localtime')),
+            id              BIGSERIAL PRIMARY KEY,
+            evaluated_at    TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
             attempt_no      INTEGER,
             submission_hash TEXT,
             team_name       TEXT,
             file_name       TEXT,
             domain          TEXT,
             problem_stmt    TEXT,
-            media_score     REAL,
-            proto_score     REAL,
-            ppt_score       REAL,
-            align_score     REAL,
-            visual_score    REAL,
-            total_score     REAL,
+            media_score     DOUBLE PRECISION,
+            proto_score     DOUBLE PRECISION,
+            ppt_score       DOUBLE PRECISION,
+            align_score     DOUBLE PRECISION,
+            visual_score    DOUBLE PRECISION,
+            total_score     DOUBLE PRECISION,
             verdict         TEXT,
             eval_status     TEXT,
             ppt_verdict     TEXT,
@@ -482,35 +413,19 @@ def ensure_audit_log_table(connection: sqlite3.Connection) -> None:
         )
         """
     )
-
-    existing_columns = {row["name"] for row in connection.execute("PRAGMA table_info(audit_log)").fetchall()}
-    for column_name, column_type in (
-        ("attempt_no", "INTEGER"),
-        ("submission_hash", "TEXT"),
-        ("eval_status", "TEXT"),
-        ("model", "TEXT"),
-        ("visual_score", "REAL"),
-        ("submission_url", "TEXT"),
-    ):
-        if column_name not in existing_columns:
-            connection.execute(f"ALTER TABLE audit_log ADD COLUMN {column_name} {column_type}")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_log_submission_attempt ON audit_log (submission_hash, attempt_no DESC)"
+    )
 
 
 def init_db() -> None:
-    connection: sqlite3.Connection | None = None
+    connection: Any | None = None
     try:
         connection = get_db_connection()
-        selected_exists = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'selected'"
-        ).fetchone()
-        if not selected_exists:
-            create_selected_table(connection)
-        elif selected_table_needs_migration(connection):
-            migrate_selected_table(connection)
-
+        create_selected_table(connection)
         ensure_audit_log_table(connection)
         connection.commit()
-    except sqlite3.OperationalError as exc:
+    except (psycopg.Error, ValueError) as exc:
         st.error(f"Database initialization failed: {exc}")
     finally:
         if connection is not None:
@@ -518,7 +433,7 @@ def init_db() -> None:
 
 
 def insert_selected(row: dict[str, Any]) -> None:
-    connection: sqlite3.Connection | None = None
+    connection: Any | None = None
     try:
         connection = get_db_connection()
         connection.execute(
@@ -538,7 +453,7 @@ def insert_selected(row: dict[str, Any]) -> None:
                 ppt_verdict,
                 align_verdict,
                 red_flags
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT(submission_hash) DO UPDATE SET
                 team_name = excluded.team_name,
                 file_name = excluded.file_name,
@@ -572,7 +487,7 @@ def insert_selected(row: dict[str, Any]) -> None:
             ),
         )
         connection.commit()
-    except sqlite3.OperationalError as exc:
+    except (psycopg.Error, ValueError) as exc:
         st.error(f"Failed to store selected participant: {exc}")
     finally:
         if connection is not None:
@@ -583,12 +498,12 @@ def delete_selected(submission_hash: str) -> None:
     if not submission_hash:
         return
 
-    connection: sqlite3.Connection | None = None
+    connection: Any | None = None
     try:
         connection = get_db_connection()
-        connection.execute("DELETE FROM selected WHERE submission_hash = ?", (submission_hash,))
+        connection.execute("DELETE FROM selected WHERE submission_hash = %s", (submission_hash,))
         connection.commit()
-    except sqlite3.OperationalError as exc:
+    except (psycopg.Error, ValueError) as exc:
         st.error(f"Failed to update selected participant store: {exc}")
     finally:
         if connection is not None:
@@ -599,7 +514,7 @@ def get_latest_evaluation(submission_hash: str) -> dict[str, Any] | None:
     if not submission_hash:
         return None
 
-    connection: sqlite3.Connection | None = None
+    connection: Any | None = None
     try:
         connection = get_db_connection()
         row = connection.execute(
@@ -626,14 +541,14 @@ def get_latest_evaluation(submission_hash: str) -> dict[str, Any] | None:
                 model,
                 submission_url
             FROM audit_log
-            WHERE submission_hash = ?
+            WHERE submission_hash = %s
             ORDER BY attempt_no DESC, id DESC
             LIMIT 1
             """,
             (submission_hash,),
         ).fetchone()
         return dict(row) if row is not None else None
-    except sqlite3.OperationalError as exc:
+    except (psycopg.Error, ValueError) as exc:
         st.error(f"Failed to read previous evaluation: {exc}")
         return None
     finally:
@@ -676,12 +591,13 @@ def build_existing_result_row(sid: str, submission: dict[str, Any], prior_eval: 
 
 
 def insert_audit_log(row: dict[str, Any]) -> None:
-    connection: sqlite3.Connection | None = None
+    connection: Any | None = None
     try:
         connection = get_db_connection()
         submission_hash_value = row.get("Submission Hash", "")
+        connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (submission_hash_value,))
         attempt_row = connection.execute(
-            "SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_attempt FROM audit_log WHERE submission_hash = ?",
+            "SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_attempt FROM audit_log WHERE submission_hash = %s",
             (submission_hash_value,),
         ).fetchone()
         attempt_no = int(attempt_row["next_attempt"]) if attempt_row is not None else 1
@@ -707,7 +623,7 @@ def insert_audit_log(row: dict[str, Any]) -> None:
                 red_flags,
                 model,
                 submission_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 attempt_no,
@@ -732,7 +648,7 @@ def insert_audit_log(row: dict[str, Any]) -> None:
             ),
         )
         connection.commit()
-    except sqlite3.OperationalError as exc:
+    except (psycopg.Error, ValueError) as exc:
         st.error(f"Failed to write audit log: {exc}")
     finally:
         if connection is not None:
@@ -1330,8 +1246,6 @@ def parse_and_validate_llm_response(raw_content: str) -> dict[str, Any]:
 
 
 def build_system_prompt(model: str) -> str:
-    if model in ANTHROPIC_MODELS:
-        return f"{SYSTEM_PROMPT}\nRespond only with valid JSON. No preamble, no markdown fences."
     return SYSTEM_PROMPT
 
 
@@ -1341,9 +1255,8 @@ def request_openai_completion(client: OpenAI, messages: list[dict[str, str]], mo
         "temperature": 0.0,
         "max_completion_tokens": RESERVED_OUTPUT_TOKENS,
         "messages": cast(Any, messages),
+        "response_format": {"type": "json_object"},
     }
-    if model not in ANTHROPIC_MODELS:
-        request_kwargs["response_format"] = {"type": "json_object"}
 
     response = client.chat.completions.create(**request_kwargs)
     raw_content = response.choices[0].message.content
@@ -1352,21 +1265,11 @@ def request_openai_completion(client: OpenAI, messages: list[dict[str, str]], mo
     return raw_content
 
 
-def call_openai(user_prompt: str, api_key: str, model: str, anthropic_key: str = "") -> dict[str, Any]:
-    """Route to correct provider via OpenAI SDK. Anthropic uses its OpenAI-compatible endpoint."""
-    is_anthropic = model in ANTHROPIC_MODELS
+def call_openai(user_prompt: str, api_key: str, model: str) -> dict[str, Any]:
+    if not api_key:
+        raise ValueError("OpenAI API key required for GPT models")
 
-    if is_anthropic:
-        if not anthropic_key:
-            raise ValueError("Anthropic API key required for Claude models")
-        client = openai.OpenAI(
-            api_key=anthropic_key,
-            base_url=ANTHROPIC_BASE_URL,
-        )
-    else:
-        if not api_key:
-            raise ValueError("OpenAI API key required for GPT models")
-        client = openai.OpenAI(api_key=api_key)
+    client = openai.OpenAI(api_key=api_key)
 
     system_prompt = build_system_prompt(model)
 
@@ -1393,10 +1296,10 @@ def call_openai(user_prompt: str, api_key: str, model: str, anthropic_key: str =
             return error_result("MODEL_OUTPUT_INVALID: scores out of allowed set")
 
 
-def safe_call_openai(user_prompt: str, api_key: str, anthropic_key: str, model: str) -> dict[str, Any]:
+def safe_call_openai(user_prompt: str, api_key: str, model: str) -> dict[str, Any]:
     for attempt in range(3):
         try:
-            return call_openai(user_prompt, api_key, model, anthropic_key)
+            return call_openai(user_prompt, api_key, model)
         except RateLimitError:
             if attempt == 2:
                 return error_result("Rate limit hit after 3 attempts.")
@@ -1578,52 +1481,25 @@ with st.sidebar:
         placeholder="sk-...",
         value="",
     )
-    anthropic_api_key_input = st.text_input(
-        "Anthropic API Key",
-        type="password",
-        placeholder="sk-ant-...",
-        value="",
-    )
 
     openai_api_key = openai_api_key_input or st.session_state.get("openai_api_key", "") or os.environ.get("OPENAI_API_KEY", "")
-    anthropic_api_key = (
-        anthropic_api_key_input
-        or st.session_state.get("anthropic_api_key", "")
-        or os.environ.get("ANTHROPIC_API_KEY", "")
-    )
 
     if openai_api_key_input:
         st.session_state["openai_api_key"] = openai_api_key_input
     elif "openai_api_key" not in st.session_state:
         st.session_state["openai_api_key"] = ""
 
-    if anthropic_api_key_input:
-        st.session_state["anthropic_api_key"] = anthropic_api_key_input
-    elif "anthropic_api_key" not in st.session_state:
-        st.session_state["anthropic_api_key"] = ""
-
     if os.environ.get("OPENAI_API_KEY"):
         st.caption("OpenAI key loaded from environment. Not shown in UI.")
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        st.caption("Anthropic key loaded from environment. Not shown in UI.")
 
     model_choice = st.selectbox(
         "Evaluation Model",
-        options=[
-            "claude-sonnet-4-6",
-            "claude-sonnet-4-5",
-            "claude-haiku-4-5-20251001",
-            "gpt-5-mini",
-            "gpt-4.1-mini",
-            "gpt-4.1",
-            "gpt-4o",
-            "gpt-4o-mini",
-        ],
+        options=MODEL_OPTIONS,
         index=0,
     )
-    provider = "Anthropic" if model_choice in ANTHROPIC_MODELS else "OpenAI"
+    provider = "OpenAI"
     st.caption(f"Provider: {provider} · Context: {MODEL_CONTEXT_WINDOWS[model_choice]:,} tokens")
-    MAX_FILES_BATCH = 15 if model_choice in ANTHROPIC_MODELS else 10
+    MAX_FILES_BATCH = 10
     st.caption(f"Batch limit: {MAX_FILES_BATCH} files for this model")
 
     st.divider()
@@ -1939,9 +1815,6 @@ st.caption(
 )
 
 if trigger:
-    if model_choice in ANTHROPIC_MODELS and not anthropic_api_key:
-        st.error("❌ Anthropic API key required for Claude models. Enter it in the sidebar.")
-        st.stop()
     if model_choice in OPENAI_MODELS and not openai_api_key:
         st.error("❌ OpenAI API key required for GPT models. Enter it in the sidebar.")
         st.stop()
@@ -2030,12 +1903,7 @@ if trigger:
                     if prompt_tokens > max_input:
                         llm_result = error_result("PROMPT_EXCEEDS_CONTEXT")
                     else:
-                        llm_result = safe_call_openai(
-                            prompt,
-                            openai_api_key,
-                            anthropic_api_key,
-                            model_choice,
-                        )
+                        llm_result = safe_call_openai(prompt, openai_api_key, model_choice)
 
                 eval_status = "FAILED" if "EVALUATION_FAILED" in llm_result.get("red_flags", []) else "SUCCESS"
                 if eval_status == "FAILED":
@@ -2189,32 +2057,14 @@ if st.session_state.results:
         st.rerun()
 
 with st.expander("📋 All Selected Participants (this event)"):
-    def get_encrypted_db_zip() -> bytes:
-        """Read selected.db and return it as an AES-encrypted zip in memory."""
-        # TODO: verify manually against current pyzipper docs once Context7 coverage is available.
-        try:
-            import pyzipper
-        except ImportError as exc:
-            raise ValueError("Encrypted DB download unavailable — install pyzipper") from exc
-
-        db_bytes = DB_PATH.read_bytes()
-        buffer = BytesIO()
-        with pyzipper.AESZipFile(
-            buffer,
-            "w",
-            # TODO: verify manually against current pyzipper docs once Context7 coverage is available.
-            compression=pyzipper.ZIP_DEFLATED,
-            encryption=pyzipper.WZ_AES,
-        ) as zf:
-            zf.setpassword(DB_DOWNLOAD_PASSWORD)
-            zf.writestr("selected.db", db_bytes)
-        return buffer.getvalue()
-
-    connection: sqlite3.Connection | None = None
+    connection: Any | None = None
     try:
         connection = get_db_connection()
-        selected_df = pd.read_sql_query("SELECT * FROM selected ORDER BY total_score DESC", connection)
-    except sqlite3.OperationalError as exc:
+        selected_rows = connection.execute(
+            "SELECT * FROM selected ORDER BY total_score DESC, inserted_at DESC"
+        ).fetchall()
+        selected_df = pd.DataFrame(selected_rows)
+    except (psycopg.Error, ValueError) as exc:
         st.error(f"Failed to load selected participants: {exc}")
         selected_df = pd.DataFrame()
     finally:
@@ -2229,16 +2079,12 @@ with st.expander("📋 All Selected Participants (this event)"):
             use_container_width=True,
             hide_index=True,
         )
-        try:
-            encrypted_db_zip = get_encrypted_db_zip()
-        except ValueError as exc:
-            st.error(str(exc))
-        else:
-            st.download_button(
-                label="⬇️ Download selected.db (password protected)",
-                data=encrypted_db_zip,
-                file_name="selected_participants.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
-            st.caption("🔒 Password: yash<3akshat")
+        export_csv = selected_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="⬇️ Download selected participants (.csv)",
+            data=export_csv,
+            file_name="selected_participants.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+        st.caption("Database credentials stay on the server and are never shown in the app UI.")
