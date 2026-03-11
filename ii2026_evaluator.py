@@ -1448,14 +1448,19 @@ def build_system_prompt(model: str) -> str:
     return SYSTEM_PROMPT
 
 
+def model_supports_temperature(model: str) -> bool:
+    return not model.startswith("gpt-5")
+
+
 def request_openai_completion(client: OpenAI, messages: list[dict[str, str]], model: str) -> str:
     request_kwargs: dict[str, Any] = {
         "model": model,
-        "temperature": 0.0,
         "max_completion_tokens": RESERVED_OUTPUT_TOKENS,
         "messages": cast(Any, messages),
         "response_format": {"type": "json_object"},
     }
+    if model_supports_temperature(model):
+        request_kwargs["temperature"] = 0.0
 
     response = client.chat.completions.create(**request_kwargs)
     raw_content = response.choices[0].message.content
