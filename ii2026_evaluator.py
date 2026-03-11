@@ -858,6 +858,18 @@ def normalize_whitespace(text: str) -> str:
     return "\n".join(line.strip() for line in text.splitlines() if line.strip())
 
 
+def sanitize_unicode(text: str) -> str:
+    """
+    Remove lone surrogate characters that cause UTF-8 encode errors.
+    Uses surrogatepass round-trip: encodes with surrogatepass (allows surrogates),
+    then decodes with ignore (silently drops unpaired surrogates).
+    Valid emojis with both surrogate halves intact are preserved.
+    """
+    if not isinstance(text, str):
+        return ""
+    return text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="ignore")
+
+
 def load_env_file(env_path: Path) -> None:
     """Load simple KEY=VALUE pairs from a local .env file into os.environ."""
     if not env_path.exists():
@@ -1013,7 +1025,7 @@ def extract_pptx_text(file_bytes: bytes) -> dict[str, str]:
                 if text:
                     parts.append(text)
         label = SLIDE_LABELS[idx] if idx < len(SLIDE_LABELS) else f"SLIDE_{idx + 1}"
-        result[label] = normalize_whitespace("\n".join(parts)) if parts else "<NO TEXT ON SLIDE>"
+        result[label] = sanitize_unicode(normalize_whitespace("\n".join(parts))) if parts else "<NO TEXT ON SLIDE>"
     if not result:
         raise ValueError("Presentation contains no slides")
     return result
@@ -1109,7 +1121,7 @@ def extract_ppt_text(file_bytes: bytes) -> dict[str, str]:
     result: dict[str, str] = {}
     for index, text in enumerate(raw_pages):
         label = SLIDE_LABELS[index] if index < len(SLIDE_LABELS) else f"PAGE_{index + 1}"
-        result[label] = text if text else "<NO TEXT ON PAGE>"
+        result[label] = sanitize_unicode(text) if text else "<NO TEXT ON PAGE>"
 
     return result
 
@@ -1194,6 +1206,8 @@ def extract_problem_statement_text(slides: dict[str, str]) -> str:
     Stage 4 — domain keyword density scoring across all slides
     Stage 5 — semantic fallback (longest substantive non-template paragraph)
     """
+    slides = {label: sanitize_unicode(text) for label, text in slides.items()}
+
     for label, content in slides.items():
         if label.upper() == "PROBLEM STATEMENT":
             cleaned = _strip_template_garbage(content)
@@ -1264,7 +1278,7 @@ def extract_problem_statement_text(slides: dict[str, str]) -> str:
 
 
 def try_extract_team_name(slides: dict[str, str]) -> str:
-    cover = slides.get("COVER / TEAM INFO", "") or slides.get("PAGE_1", "")
+    cover = sanitize_unicode(slides.get("COVER / TEAM INFO", "") or slides.get("PAGE_1", ""))
 
     match = re.search(
         r"team\s*name\s*[:\-–]\s*([^\n\r]{2,60})",
