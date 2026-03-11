@@ -69,7 +69,7 @@ import streamlit as st
 import tiktoken
 from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
 from pptx import Presentation
-from psycopg.rows import dict_row
+from psycopg.rows import dict_row, DictRow
 
 IN_THRESHOLD = 0.60
 MAX_PPT_TOKENS = 3000
@@ -347,17 +347,17 @@ def get_database_url() -> str:
     return os.environ.get(DATABASE_URL_ENV_VAR, "").strip()
 
 
-def get_db_connection() -> Any:
+def get_db_connection() -> "psycopg.Connection[DictRow]":
     database_url = get_database_url()
     if not database_url:
         raise ValueError(
             "DATABASE_URL is not configured. Add it to the server environment or local .env file."
         )
 
-    return psycopg.connect(database_url, row_factory=dict_row)
+    return psycopg.connect(database_url, row_factory=dict_row)  # type: ignore[return-value]
 
 
-def create_selected_table(connection: Any) -> None:
+def create_selected_table(connection: "psycopg.Connection[DictRow]") -> None:
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS selected (
@@ -385,7 +385,7 @@ def create_selected_table(connection: Any) -> None:
     )
 
 
-def ensure_audit_log_table(connection: Any) -> None:
+def ensure_audit_log_table(connection: "psycopg.Connection[DictRow]") -> None:
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS audit_log (
@@ -419,7 +419,7 @@ def ensure_audit_log_table(connection: Any) -> None:
 
 
 def init_db() -> None:
-    connection: Any | None = None
+    connection: "psycopg.Connection[DictRow] | None" = None
     try:
         connection = get_db_connection()
         create_selected_table(connection)
@@ -433,7 +433,7 @@ def init_db() -> None:
 
 
 def insert_selected(row: dict[str, Any]) -> None:
-    connection: Any | None = None
+    connection: "psycopg.Connection[DictRow] | None" = None
     try:
         connection = get_db_connection()
         connection.execute(
@@ -498,7 +498,7 @@ def delete_selected(submission_hash: str) -> None:
     if not submission_hash:
         return
 
-    connection: Any | None = None
+    connection: "psycopg.Connection[DictRow] | None" = None
     try:
         connection = get_db_connection()
         connection.execute("DELETE FROM selected WHERE submission_hash = %s", (submission_hash,))
@@ -514,7 +514,7 @@ def get_latest_evaluation(submission_hash: str) -> dict[str, Any] | None:
     if not submission_hash:
         return None
 
-    connection: Any | None = None
+    connection: "psycopg.Connection[DictRow] | None" = None
     try:
         connection = get_db_connection()
         row = connection.execute(
@@ -591,7 +591,7 @@ def build_existing_result_row(sid: str, submission: dict[str, Any], prior_eval: 
 
 
 def insert_audit_log(row: dict[str, Any]) -> None:
-    connection: Any | None = None
+    connection: "psycopg.Connection[DictRow] | None" = None
     try:
         connection = get_db_connection()
         submission_hash_value = row.get("Submission Hash", "")
@@ -2057,7 +2057,7 @@ if st.session_state.results:
         st.rerun()
 
 with st.expander("📋 All Selected Participants (this event)"):
-    connection: Any | None = None
+    connection: "psycopg.Connection[DictRow] | None" = None
     try:
         connection = get_db_connection()
         selected_rows = connection.execute(
