@@ -9,3 +9,4 @@ pdfplumber>=0.11
 Pillow>=10.0
 pytesseract>=0.3.10
 pdf2image>=1.17
+rich>=13.7

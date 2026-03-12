@@ -1372,8 +1372,9 @@ def get_poppler_path() -> str | None:
         if configured_path and Path(configured_path).exists():
             return configured_path
 
-    if shutil.which("pdftoppm"):
-        return None
+    found = shutil.which("pdftoppm")
+    if found:
+        return str(Path(found).parent)
 
     if os.name == "nt":
         windows_candidates = [
@@ -1384,6 +1385,16 @@ def get_poppler_path() -> str | None:
         for candidate in windows_candidates:
             if candidate.exists():
                 return str(candidate)
+
+        # winget (oschwartz10612.Poppler) installs under LOCALAPPDATA by default
+        localappdata = os.environ.get("LOCALAPPDATA", "").strip()
+        if localappdata:
+            base = Path(localappdata) / "Microsoft" / "WinGet" / "Packages"
+            if base.exists():
+                for pkg in sorted(base.glob("oschwartz10612.Poppler_*"), reverse=True):
+                    for bin_dir in sorted(pkg.glob("poppler-*/Library/bin"), reverse=True):
+                        if (bin_dir / "pdftoppm.exe").exists():
+                            return str(bin_dir)
 
     return None
 
@@ -1693,10 +1704,8 @@ def pdf_to_base64_images(file_bytes: bytes) -> list[str]:
         images = pdf2image.convert_from_bytes(file_bytes, **convert_kwargs)
     except PDFInfoNotInstalledError as exc:
         raise ValueError(
-            "Poppler not found. Install it:\n"
-            "  Linux: apt-get install poppler-utils\n"
-            "  Windows: https://github.com/oschwartz10612/poppler-windows/releases\n"
-            "  Or set POPPLER_PATH=C:\\path\\to\\poppler\\Library\\bin in .env"
+            "Poppler not found. Install it: apt-get install poppler-utils  "
+            "or set POPPLER_PATH=/usr/bin in .env"
         ) from exc
     except (PDFPageCountError, PDFSyntaxError) as exc:
         raise ValueError(f"Could not read PDF pages: {exc}") from exc
