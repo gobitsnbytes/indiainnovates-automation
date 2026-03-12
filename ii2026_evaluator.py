@@ -1941,9 +1941,58 @@ def extract_github_url_candidates(text: str) -> list[str]:
     return candidates
 
 
+def normalize_proto_signal_strength(value: Any, fallback_prototype_present: bool = False) -> str:
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"none", "weak", "strong"}:
+            return normalized
+    return "weak" if fallback_prototype_present else "none"
+
+
+def _github_signal_strength(github_check_raw: Any) -> str:
+    github_check = github_check_raw if isinstance(github_check_raw, dict) else {}
+    if not github_check.get("url_found"):
+        return "none"
+
+    if github_check.get("exists") and github_check.get("has_commits"):
+        commit_count = github_check.get("commit_count")
+        if isinstance(commit_count, int) and (commit_count > 5 or commit_count == -1):
+            return "strong"
+        return "weak"
+
+    if github_check.get("exists"):
+        return "weak"
+
+    return "none"
+
+
+def compute_proto_rating_from_signals(
+    prototype_signal_strength: Any,
+    github_check_raw: Any,
+    proto_default: int = 0,
+    fallback_prototype_present: bool = False,
+) -> int:
+    prototype_strength = normalize_proto_signal_strength(
+        prototype_signal_strength,
+        fallback_prototype_present=fallback_prototype_present,
+    )
+    github_strength = _github_signal_strength(github_check_raw)
+
+    if prototype_strength == "strong" or github_strength == "strong":
+        return 5
+    if prototype_strength == "weak" or github_strength == "weak":
+        return max(1, proto_default)
+    return 0
+
+
 def parse_proto_github_detection(raw_content: str) -> dict[str, Any]:
     parsed = json.loads(raw_content)
-    prototype_present = bool(parsed.get("prototype_present"))
+    prototype_present_raw = bool(parsed.get("prototype_present"))
+    prototype_signal_strength = normalize_proto_signal_strength(
+        parsed.get("prototype_signal_strength"),
+        fallback_prototype_present=prototype_present_raw,
+    )
+    prototype_present = prototype_signal_strength != "none"
     prototype_evidence = str(parsed.get("prototype_evidence", "") or "").strip()[:160]
     github_check = parsed.get("github_check") if isinstance(parsed.get("github_check"), dict) else {}
 
@@ -1967,6 +2016,7 @@ def parse_proto_github_detection(raw_content: str) -> dict[str, Any]:
 
     return {
         "prototype_present": prototype_present,
+        "prototype_signal_strength": prototype_signal_strength,
         "prototype_evidence": prototype_evidence,
         "github_check": {
             "url_found": url_found,
@@ -1982,15 +2032,11 @@ def parse_proto_github_detection(raw_content: str) -> dict[str, Any]:
 
 
 def compute_proto_rating_from_detection(detection: dict[str, Any]) -> int:
-    prototype_present = bool(detection.get("prototype_present"))
-    github_check_raw = detection.get("github_check")
-    github_check: dict[str, Any] = github_check_raw if isinstance(github_check_raw, dict) else {}
-    github_present = bool(github_check.get("exists")) and bool(github_check.get("has_commits"))
-    if prototype_present and github_present:
-        return 5
-    if prototype_present or github_present:
-        return 1
-    return 0
+    return compute_proto_rating_from_signals(
+        detection.get("prototype_signal_strength"),
+        detection.get("github_check"),
+        fallback_prototype_present=bool(detection.get("prototype_present")),
+    )
 
 
 def detect_proto_and_github_signal(
@@ -2029,13 +2075,19 @@ PRE-CHECKED GITHUB FROM EXTRACTED TEXT:
 
 INSTRUCTIONS:
 - Read all slide images carefully.
-- Prototype means visible product UI, demo screen, app screen, dashboard, workflow mockup, or deployed interface.
+- Prototype means credible evidence that the team actually built something: real app screens, demo flow,
+    dashboard with real data, deployed interface, hardware photos, device photos, PCB photos, or a physical prototype in use.
+- Rate prototype evidence as:
+    - strong = clear, credible build evidence such as multiple real screens/photos, a functioning device, or an actual demo flow.
+    - weak = some plausible real build evidence, but limited, partial, blurry, or unclear.
+    - none = no credible built prototype evidence.
 - If you see a GitHub repository URL in the slides and it was not already verified above, call the check_github_repo tool.
-- Be strict. Generic icons, architecture blocks, logos, or stock illustrations do not count as a prototype.
+- Be strict. Wireframes, mockups, CAD renders, architecture blocks, logos, or stock illustrations do not count as a prototype.
 
 Return strict JSON only:
 {{
   "prototype_present": <true|false>,
+    "prototype_signal_strength": "<none|weak|strong>",
   "prototype_evidence": "<short sentence, max 20 words>",
   "github_check": {{
     "url_found": "<url or null>",
@@ -2427,6 +2479,15 @@ def parse_and_validate_llm_response(raw_content: str) -> dict[str, Any]:
     if not isinstance(parsed.get("red_flags"), list):
         parsed["red_flags"] = []
     parsed["red_flags"] = [str(flag)[:120] for flag in parsed["red_flags"][:6]]
+    parsed["has_product_photos"] = bool(parsed.get("has_product_photos"))
+    parsed["prototype_signal_strength"] = normalize_proto_signal_strength(
+        parsed.get("prototype_signal_strength"),
+        fallback_prototype_present=parsed["has_product_photos"],
+    )
+    if not isinstance(parsed.get("prototype_evidence"), str):
+        parsed["prototype_evidence"] = ""
+    else:
+        parsed["prototype_evidence"] = parsed["prototype_evidence"].strip()[:160]
     return parsed
 
 
@@ -3596,7 +3657,9 @@ with st.form("review_inputs_form", clear_on_submit=False):
                     f"Missing {required_missing} · Tokens {token_count}/{MAX_PPT_TOKENS}"
                 )
                 if is_vision and st.session_state.get("server_queue_unlocked"):
-                    st.caption("Private mode auto-scores Prototype + GitHub from slide evidence: both=5, one=1, none=0.")
+                    st.caption(
+                        "Private mode auto-scores Prototype + GitHub from slide evidence: strong=5, weak=1, none=0."
+                    )
 
             grid_col_1, grid_col_2 = st.columns([1.85, 1.25])
 
