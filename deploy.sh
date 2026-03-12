@@ -30,8 +30,10 @@ git reset --hard "origin/$DEPLOY_BRANCH"
 echo "==> Installing system packages"
 sudo apt-get update
 sudo apt-get install -y \
+  python3-venv \
   poppler-utils \
   tesseract-ocr \
+  libreoffice \
   libreoffice-impress
 
 echo "==> Ensuring virtual environment"
@@ -48,6 +50,14 @@ if [[ -f "$REQUIREMENTS_FILE" ]]; then
   echo "==> Installing Python dependencies"
   python -m pip install -r "$REQUIREMENTS_FILE"
 fi
+
+echo "==> Verifying required runtime binaries"
+for required_bin in pdftoppm tesseract soffice; do
+  if ! command -v "$required_bin" >/dev/null 2>&1; then
+    echo "Missing required binary: $required_bin" >&2
+    exit 1
+  fi
+done
 
 canonical_service_unit() {
   local service_name="$1"

@@ -8,6 +8,9 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 DOMAIN="${1:-}"
 EMAIL="${2:-}"
 INSTANCE_COUNT="${INSTANCE_COUNT:-2}"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+VENV_DIR="${VENV_DIR:-.venv}"
+REQUIREMENTS_FILE="${REQUIREMENTS_FILE:-requirements.txt}"
 
 if [[ -z "$DOMAIN" ]]; then
   echo "Usage: $0 <your-domain.com> <your-email@example.com>"
@@ -23,9 +26,44 @@ fi
 echo "==> Setting up multi-core deployment for $DOMAIN"
 
 # Install required packages
-echo "==> Installing Nginx and Certbot"
+echo "==> Installing system packages"
 sudo apt update
-sudo apt install -y nginx certbot python3-certbot-nginx
+sudo apt install -y \
+  nginx \
+  certbot \
+  python3-certbot-nginx \
+  python3-venv \
+  poppler-utils \
+  tesseract-ocr \
+  libreoffice \
+  libreoffice-impress
+
+if [[ "$VENV_DIR" == ".venv" && ! -d "$VENV_DIR" && -d "venv" ]]; then
+  VENV_DIR="venv"
+fi
+
+echo "==> Ensuring Python virtual environment"
+if [[ ! -d "$VENV_DIR" ]]; then
+  "$PYTHON_BIN" -m venv "$VENV_DIR"
+fi
+
+# shellcheck disable=SC1091
+source "$VENV_DIR/bin/activate"
+
+python -m pip install --upgrade pip
+
+if [[ -f "$REQUIREMENTS_FILE" ]]; then
+  echo "==> Installing Python dependencies"
+  python -m pip install -r "$REQUIREMENTS_FILE"
+fi
+
+echo "==> Verifying required runtime binaries"
+for required_bin in pdftoppm tesseract soffice; do
+  if ! command -v "$required_bin" >/dev/null 2>&1; then
+    echo "Missing required binary: $required_bin" >&2
+    exit 1
+  fi
+done
 
 # Copy and configure systemd service
 echo "==> Installing systemd service"

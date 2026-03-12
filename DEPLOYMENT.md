@@ -25,10 +25,11 @@ sudo apt install -y nginx certbot python3-certbot-nginx
 These packages are needed for:
 - OCR fallback on image-based PDFs
 - PPT/PPTX browser preview conversion
+- GPT-4.1 vision mode for PDF/PPT/PPTX slide rendering
 
 ```bash
 sudo apt update
-sudo apt install -y poppler-utils tesseract-ocr libreoffice-impress
+sudo apt install -y python3-venv poppler-utils tesseract-ocr libreoffice libreoffice-impress
 ```
 
 ## Step 2: Set Up Application
@@ -41,7 +42,9 @@ git pull
 REPO_DIR="$(pwd -P)"
 
 # Activate virtual environment and install dependencies
+python3 -m venv .venv
 source .venv/bin/activate  # or: source venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
@@ -196,7 +199,12 @@ which tesseract
 which soffice
 
 # Reinstall if needed
-sudo apt install -y poppler-utils tesseract-ocr libreoffice-impress
+sudo apt install -y python3-venv poppler-utils tesseract-ocr libreoffice libreoffice-impress
+
+# Reinstall Python packages if needed
+source "$REPO_DIR"/.venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
 ```
 
 ### If Nginx returns 502 Bad Gateway:

@@ -1,2 +1,5 @@
-apt-get install -y tesseract-ocr poppler-utils
-pip install pypdf>=4.0 pdfplumber pillow pytesseract pdf2image pyzipper
+apt-get install -y python3-venv tesseract-ocr poppler-utils libreoffice libreoffice-impress
+python3 -m venv .venv
+. .venv/bin/activate
+pip install --upgrade pip
+pip install -r requirements.txt
