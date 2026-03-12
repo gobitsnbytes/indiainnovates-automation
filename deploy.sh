@@ -59,6 +59,8 @@ for required_bin in pdftoppm tesseract soffice; do
   fi
 done
 
+echo "==> Linux runtime dependencies verified (Poppler/Tesseract/LibreOffice present)"
+
 canonical_service_unit() {
   local service_name="$1"
   if [[ "$service_name" == *.service ]]; then

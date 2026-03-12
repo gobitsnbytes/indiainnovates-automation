@@ -85,6 +85,7 @@ ENV_PATH = BASE_DIR / ".env"
 DATABASE_URL_ENV_VAR = "DATABASE_URL"
 SUBMISSION_CSV_ENV_VAR = "II2026_SUBMISSIONS_CSV"
 GITHUB_TOKEN_ENV_VAR = "GITHUB_TOKEN"
+POPPLER_PATH_ENV_VARS = ("POPPLER_PATH", "II2026_POPPLER_PATH")
 SECRET_QUEUE_CODE = "aero"
 
 MAX_UPLOAD_MB = max(20, int(os.environ.get("II2026_MAX_UPLOAD_MB", "50")))
@@ -121,7 +122,10 @@ DEFAULT_SUBMISSION_CSV_CANDIDATES = [
 def get_ocr_dependency_hint(component: str) -> str:
     if os.name == "nt":
         if component == "poppler":
-            return "OCR unavailable — install Poppler for Windows or use a text-based PDF/PPTX."
+            return (
+                "OCR unavailable — install Poppler for Windows, add its Library\\bin folder to PATH, "
+                "or set POPPLER_PATH in .env."
+            )
         if component == "tesseract":
             return "OCR unavailable — install Tesseract OCR for Windows or use a text-based PDF/PPTX."
     if component == "poppler":
@@ -1362,6 +1366,28 @@ def load_env_file(env_path: Path) -> None:
         return
 
 
+def get_poppler_path() -> str | None:
+    for env_var in POPPLER_PATH_ENV_VARS:
+        configured_path = os.environ.get(env_var, "").strip()
+        if configured_path and Path(configured_path).exists():
+            return configured_path
+
+    if shutil.which("pdftoppm"):
+        return None
+
+    if os.name == "nt":
+        windows_candidates = [
+            Path("C:/Program Files/poppler/Library/bin"),
+            Path("C:/Program Files (x86)/poppler/Library/bin"),
+            Path.home() / "poppler" / "Library" / "bin",
+        ]
+        for candidate in windows_candidates:
+            if candidate.exists():
+                return str(candidate)
+
+    return None
+
+
 def is_placeholder_text(text: str) -> bool:
     normalized = normalize_whitespace(text)
     if not normalized:
@@ -1582,7 +1608,11 @@ def extract_ppt_text(file_bytes: bytes) -> dict[str, str]:
 
             raw_pages = []
             try:
-                images = pdf2image.convert_from_bytes(file_bytes, dpi=200)
+                poppler_path = get_poppler_path()
+                convert_kwargs: dict[str, Any] = {"dpi": 200}
+                if poppler_path:
+                    convert_kwargs["poppler_path"] = poppler_path
+                images = pdf2image.convert_from_bytes(file_bytes, **convert_kwargs)
             except (PDFInfoNotInstalledError, PDFPageCountError, PDFSyntaxError) as exc:
                 raise ValueError(get_ocr_dependency_hint("poppler")) from exc
 
@@ -1652,17 +1682,21 @@ def pdf_to_base64_images(file_bytes: bytes) -> list[str]:
         raise ValueError("Pillow not installed — run: pip install Pillow") from exc
 
     try:
-        images = pdf2image.convert_from_bytes(
-            file_bytes,
-            dpi=PDF_VISION_DPI,
-            fmt="jpeg",
-            thread_count=2,
-        )
+        poppler_path = get_poppler_path()
+        convert_kwargs: dict[str, Any] = {
+            "dpi": PDF_VISION_DPI,
+            "fmt": "jpeg",
+            "thread_count": 2,
+        }
+        if poppler_path:
+            convert_kwargs["poppler_path"] = poppler_path
+        images = pdf2image.convert_from_bytes(file_bytes, **convert_kwargs)
     except PDFInfoNotInstalledError as exc:
         raise ValueError(
             "Poppler not found. Install it:\n"
             "  Linux: apt-get install poppler-utils\n"
-            "  Windows: https://github.com/oschwartz10612/poppler-windows/releases"
+            "  Windows: https://github.com/oschwartz10612/poppler-windows/releases\n"
+            "  Or set POPPLER_PATH=C:\\path\\to\\poppler\\Library\\bin in .env"
         ) from exc
     except (PDFPageCountError, PDFSyntaxError) as exc:
         raise ValueError(f"Could not read PDF pages: {exc}") from exc

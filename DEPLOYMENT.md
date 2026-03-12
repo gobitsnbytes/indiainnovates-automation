@@ -53,7 +53,17 @@ Optional environment settings:
 ```bash
 # Increase/decrease the in-app processing limit (default: 50MB)
 export II2026_MAX_UPLOAD_MB=50
+
+# Required for GPT evaluation
+export OPENAI_API_KEY=sk-...
+
+# Optional: improves GitHub API rate limits and enables private repo checks
+export GITHUB_TOKEN=github_pat_...
 ```
+
+Linux note:
+- `POPPLER_PATH` is not needed on Ubuntu/Debian when `poppler-utils` is installed.
+- The app's PDF vision/OCR path will use `pdftoppm` from the normal system PATH.
 
 If your repo is not in `/root/indiainnovates-automation`, use that real path everywhere below.
 The included scripts now auto-detect the current repo directory instead of assuming `/opt/...`.
@@ -197,6 +207,9 @@ streamlit run "$REPO_DIR"/ii2026_evaluator.py --server.port=8501
 which pdftoppm
 which tesseract
 which soffice
+
+# On Linux, POPPLER_PATH should usually be unset
+echo "$POPPLER_PATH"
 
 # Reinstall if needed
 sudo apt install -y python3-venv poppler-utils tesseract-ocr libreoffice libreoffice-impress
